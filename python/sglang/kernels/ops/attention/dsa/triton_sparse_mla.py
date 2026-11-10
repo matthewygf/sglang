@@ -97,17 +97,88 @@ def _as_scaled_fp8_kv(
 
 
 @triton.jit
+def _mxfp4_code_bf16_software(code, encoded_scale):
+    """Exact E2M1/E8M0 reconstruction in the bounded [-30, 30] scale domain."""
+    magnitude = code & 7
+    # Direct floating-point bit construction follows vLLM's _e2m1_inline
+    # (Apache-2.0); here the bounded scale permits constructing BF16 directly.
+    # Normal E2M1 magnitudes 2..7 map to this BF16 exponent/mantissa pattern.
+    bits = tl.where(magnitude == 1, 0x3F00, 0x3F00 + (magnitude << 6))
+    bits += (encoded_scale.to(tl.int32) - 127) << 7
+    bits |= (code & 8) << 12
+    # Both E2M1 zero encodings reconstruct to positive zero in this codec.
+    bits = tl.where(magnitude == 0, 0, bits)
+    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
+def _mxfp4_pair_bf16_gfx950(packed, encoded_scale):
+    """Convert one byte's two nibbles with the gfx950 scaled BF16 converter."""
+    # The packed-conversion pattern follows vLLM's Apache-2.0
+    # v1/attention/ops/mxfp4_mla/read.py (0599e4ba72fd). Fuse the actual E8M0
+    # scale, as in this tree's smallm_moe_gfx950/smallm_moe.hip::cvt8.
+    scale = (encoded_scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    pair = tl.inline_asm_elementwise(
+        asm="v_cvt_scalef32_pk_bf16_fp4 $0, $1, $2 op_sel:[0,0,0]",
+        constraints="=v,v,v",
+        args=[packed, scale],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    # srcSel=0 converts the low byte, low nibble first. Clear negative zero
+    # using the input codes, preserving the standalone codec's bit contract.
+    low_bits = tl.where((packed & 7) == 0, 0, pair & 0xFFFF)
+    high_bits = tl.where((packed & 0x70) == 0, 0, pair >> 16)
+    low = low_bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    high = high_bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    return low, high
+
+
+@triton.jit
 def _load_kv_group(
-    kv_base, valid, GROUP: tl.constexpr, D_V: tl.constexpr, KV_SCALED: tl.constexpr
+    kv_base,
+    valid,
+    GROUP: tl.constexpr,
+    D_V: tl.constexpr,
+    KV_SCALED: tl.constexpr,
+    KV_MXFP4: tl.constexpr = False,
+    MXFP4_HW_UNPACK: tl.constexpr = False,
 ):
     """Load NoPE columns [GROUP * 128, GROUP * 128 + 128) of [BLOCK_K] KV rows."""
     g = tl.arange(0, _G)
-    kv = tl.load(kv_base + (GROUP * _G + g)[None, :], mask=valid[:, None], other=0.0)
-    if KV_SCALED:
-        scale_ptr = (kv_base + D_V).to(tl.pointer_type(tl.float32)) + GROUP
-        scale = tl.load(scale_ptr, mask=valid[:, None], other=0.0)
-        kv = kv.to(tl.float32) * scale
-    return kv
+    if KV_MXFP4:
+        # Load each payload byte and group scale once. Expanding only after
+        # loading avoids duplicated byte/scale loads across the 128 values.
+        rows: tl.constexpr = valid.shape[0]
+        packed = tl.load(
+            kv_base + (GROUP * (_G // 2) + tl.arange(0, _G // 2))[None, :],
+            mask=valid[:, None],
+            other=0,
+        ).to(tl.int32)
+        encoded_scale = tl.load(
+            kv_base + D_V // 2 + (GROUP * 4 + tl.arange(0, 4))[None, :],
+            mask=valid[:, None],
+            other=127,
+        ).to(tl.int32)
+        encoded_scale = tl.broadcast_to(
+            encoded_scale[:, :, None], (rows, 4, 16)
+        ).reshape(rows, _G // 2)
+        if MXFP4_HW_UNPACK:
+            low, high = _mxfp4_pair_bf16_gfx950(packed, encoded_scale)
+        else:
+            low = _mxfp4_code_bf16_software(packed & 15, encoded_scale)
+            high = _mxfp4_code_bf16_software(packed >> 4, encoded_scale)
+        return tl.interleave(low, high)
+    else:
+        kv = tl.load(
+            kv_base + (GROUP * _G + g)[None, :], mask=valid[:, None], other=0.0
+        )
+        if KV_SCALED:
+            scale_ptr = (kv_base + D_V).to(tl.pointer_type(tl.float32)) + GROUP
+            scale = tl.load(scale_ptr, mask=valid[:, None], other=0.0)
+            kv = kv.to(tl.float32) * scale
+        return kv
 
 
 @triton.jit
@@ -118,9 +189,15 @@ def _load_kv_tail(
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     KV_SCALED: tl.constexpr,
+    KV_MXFP4: tl.constexpr = False,
 ):
     dt = tl.arange(0, D_TAIL)
-    if KV_SCALED:
+    if KV_MXFP4:
+        tail_base = (kv_base + D_V // 2 + D_V // 32).to(
+            tl.pointer_type(tl.bfloat16)
+        )
+        tail_ptr = tail_base + dt[None, :]
+    elif KV_SCALED:
         # The BF16 tail follows the FP8 NoPE bytes and one FP32 scale per group.
         tail_base = (kv_base + D_V + 4 * NUM_GROUPS).to(tl.pointer_type(tl.bfloat16))
         tail_ptr = tail_base + dt[None, :]
@@ -134,6 +211,14 @@ def _async_copy_is_harmful_on_device(device: int) -> bool:
     properties = torch.cuda.get_device_properties(device)
     arch = getattr(properties, "gcnArchName", "") or ""
     return arch.split(":", 1)[0] in _ASYNC_COPY_OFF_ARCHES
+
+
+@functools.lru_cache(maxsize=None)
+def _mxfp4_hw_unpack_supported(device: int) -> bool:
+    """The native FP4 pair converter is available on gfx950 only."""
+    properties = torch.cuda.get_device_properties(device)
+    arch = getattr(properties, "gcnArchName", "") or ""
+    return arch.split(":", 1)[0] == "gfx950"
 
 
 def _async_copy_is_harmful() -> bool:
@@ -705,6 +790,9 @@ def _sparse_mla_fused_kernel(
     BLOCK_K: tl.constexpr,
     USE_I64_PAGE: tl.constexpr = True,
     PIPE_STAGES: tl.constexpr = 3,
+    KV_MXFP4: tl.constexpr = False,
+    STRIDE_KV_T: tl.constexpr = 0,
+    MXFP4_HW_UNPACK: tl.constexpr = False,
 ):
     """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
     t = tl.program_id(0)
@@ -776,17 +864,26 @@ def _sparse_mla_fused_kernel(
         if USE_I64_PAGE:
             page = page.to(tl.int64)
 
-        kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = _load_kv_group(kv_base, valid, 0, D_V, KV_SCALED).to(input_type)
+        kv_stride: tl.constexpr = STRIDE_KV_T if STRIDE_KV_T else KV_DIM
+        kv_base = kv_ptr + page[:, None] * kv_stride
+        kv0 = _load_kv_group(
+            kv_base, valid, 0, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+        ).to(input_type)
         if NUM_GROUPS >= 2:
-            kv1 = _load_kv_group(kv_base, valid, 1, D_V, KV_SCALED).to(input_type)
+            kv1 = _load_kv_group(
+                kv_base, valid, 1, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+            ).to(input_type)
         if NUM_GROUPS >= 3:
-            kv2 = _load_kv_group(kv_base, valid, 2, D_V, KV_SCALED).to(input_type)
+            kv2 = _load_kv_group(
+                kv_base, valid, 2, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+            ).to(input_type)
         if NUM_GROUPS >= 4:
-            kv3 = _load_kv_group(kv_base, valid, 3, D_V, KV_SCALED).to(input_type)
-        kv_tail = _load_kv_tail(kv_base, valid, D_V, D_TAIL, NUM_GROUPS, KV_SCALED).to(
-            input_type
-        )
+            kv3 = _load_kv_group(
+                kv_base, valid, 3, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+            ).to(input_type)
+        kv_tail = _load_kv_tail(
+            kv_base, valid, D_V, D_TAIL, NUM_GROUPS, KV_SCALED, KV_MXFP4
+        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -892,6 +989,9 @@ def _sparse_mla_split_k_kernel(
     BLOCK_K: tl.constexpr,
     topk_length_ptr=None,
     USE_TOPK_LENGTH: tl.constexpr = False,
+    KV_MXFP4: tl.constexpr = False,
+    STRIDE_KV_T: tl.constexpr = 0,
+    MXFP4_HW_UNPACK: tl.constexpr = False,
 ):
     """Split-K partial kernel. grid=(seq, head_blocks, kv_splits).
 
@@ -975,17 +1075,26 @@ def _sparse_mla_split_k_kernel(
         valid = valid & (slot >= 0)
         page = tl.where(valid, slot, 0).to(tl.int64)
 
-        kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = _load_kv_group(kv_base, valid, 0, D_V, KV_SCALED).to(input_type)
+        kv_stride: tl.constexpr = STRIDE_KV_T if STRIDE_KV_T else KV_DIM
+        kv_base = kv_ptr + page[:, None] * kv_stride
+        kv0 = _load_kv_group(
+            kv_base, valid, 0, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+        ).to(input_type)
         if NUM_GROUPS >= 2:
-            kv1 = _load_kv_group(kv_base, valid, 1, D_V, KV_SCALED).to(input_type)
+            kv1 = _load_kv_group(
+                kv_base, valid, 1, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+            ).to(input_type)
         if NUM_GROUPS >= 3:
-            kv2 = _load_kv_group(kv_base, valid, 2, D_V, KV_SCALED).to(input_type)
+            kv2 = _load_kv_group(
+                kv_base, valid, 2, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+            ).to(input_type)
         if NUM_GROUPS >= 4:
-            kv3 = _load_kv_group(kv_base, valid, 3, D_V, KV_SCALED).to(input_type)
-        kv_tail = _load_kv_tail(kv_base, valid, D_V, D_TAIL, NUM_GROUPS, KV_SCALED).to(
-            input_type
-        )
+            kv3 = _load_kv_group(
+                kv_base, valid, 3, D_V, KV_SCALED, KV_MXFP4, MXFP4_HW_UNPACK
+            ).to(input_type)
+        kv_tail = _load_kv_tail(
+            kv_base, valid, D_V, D_TAIL, NUM_GROUPS, KV_SCALED, KV_MXFP4
+        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:

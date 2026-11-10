@@ -8,6 +8,8 @@ on DSA shapes:
   output:  [1, bs, H, D_V]  bf16
 """
 
+from typing import Literal
+
 import torch
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -20,6 +22,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _gfx950_sparse_mla_num_warps,
     _is_gfx950_sparse_mla_fp8,
     _kv_splits_heuristic,
+    _mxfp4_hw_unpack_supported,
     _next_pow2,
     _no_async_copy,
     _page_offsets_fit_i32,
@@ -89,6 +92,8 @@ def triton_sparse_mla_decode_splitk(
     return_lse: bool = False,
     topk_length: torch.Tensor | None = None,
     expected_topk: int | None = None,
+    kv_format: Literal["auto", "mxfp4"] = "auto",
+    mxfp4_unpack: Literal["auto", "software", "gfx950"] = "auto",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
@@ -100,11 +105,68 @@ def triton_sparse_mla_decode_splitk(
     topk_length: [bs] int32; row t attends indices[t, 0, :topk_length[t]] only,
         e.g. a DCP rank's compacted share of the global top-k
     expected_topk: typical topk_length, which sizes the split count instead of topk
+    kv_format: "auto" preserves the existing BF16/raw-FP8/scaled-FP8 layout
+        selection. Experimental "mxfp4" requires BF16 queries and uint8
+        [num_pages, 1, 400] rows: 256 E2M1 payload bytes, 16 group-32 E8M0
+        scales, then 128 BF16 RoPE bytes. The low nibble is the even element.
+        Row padding is supported with a unit byte-column stride and an even
+        physical row stride >= 400. This bounded-codec experiment requires
+        finite values and E8M0 exponents in [-30, 30], a caller-validated
+        content precondition. It is not a server dtype or a general MXFP4
+        input API. No whole-cache reconstruction is made.
+    mxfp4_unpack: experimental MXFP4 reader selection for validation/ablation;
+        "auto" uses the native pair converter on gfx950 and software elsewhere.
+        Both reconstruct the same BF16 operands. "gfx950" requires that device.
     returns: [1, bs, H, d_v] bf16, plus the [bs, H] fp32 natural-log LSE
     (-inf for rows with no key) when return_lse
     """
-    kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
-    is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
+    if mxfp4_unpack not in ("auto", "software", "gfx950"):
+        raise ValueError(f"Unsupported MXFP4 unpack implementation: {mxfp4_unpack!r}.")
+    if kv_format != "mxfp4" and mxfp4_unpack != "auto":
+        raise ValueError("mxfp4_unpack is only supported with kv_format='mxfp4'.")
+    kv_mxfp4 = kv_format == "mxfp4"
+    mxfp4_hw_unpack = False
+    if kv_mxfp4:
+        if (
+            q_nope.dtype != torch.bfloat16
+            or q_rope.dtype != torch.bfloat16
+            or d_v != 512
+            or q_nope.ndim != 3
+            or q_nope.shape[-1] != 512
+            or q_rope.shape != (*q_nope.shape[:2], 64)
+        ):
+            raise ValueError(
+                "Experimental MXFP4 MLA requires BF16 [N,H,512/64] queries."
+            )
+        if kv.dtype != torch.uint8 or kv.ndim != 3 or kv.shape[1:] != (1, 400):
+            raise ValueError(
+                "Experimental MXFP4 MLA requires uint8 [pages,1,400] KV rows."
+            )
+        if (
+            kv.stride(-1) != 1
+            or kv.stride(0) < 400
+            or kv.stride(0) % 2
+            or kv.data_ptr() % 2
+        ):
+            raise ValueError(
+                "Experimental MXFP4 MLA requires unit byte-column stride and "
+                "BF16-aligned rows with physical row stride >= 400."
+            )
+        kv_scaled = False
+        is_fp8 = False
+        stride_kv_t = kv.stride(0)
+        if mxfp4_unpack != "software":
+            mxfp4_hw_unpack = q_nope.is_cuda and _mxfp4_hw_unpack_supported(
+                q_nope.device.index
+            )
+            if mxfp4_unpack == "gfx950" and not mxfp4_hw_unpack:
+                raise ValueError("Native MXFP4 unpack requires a gfx950 GPU.")
+    elif kv_format == "auto":
+        kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
+        is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
+        stride_kv_t = 0  # Preserve the existing contiguous-row addressing.
+    else:
+        raise ValueError(f"Unsupported sparse MLA KV format: {kv_format!r}.")
     use_fp8_dot = is_fp8 and not kv_scaled
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
@@ -208,6 +270,9 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
                 KV_SCALED=kv_scaled,
+                KV_MXFP4=kv_mxfp4,
+                STRIDE_KV_T=stride_kv_t,
+                MXFP4_HW_UNPACK=mxfp4_hw_unpack,
                 STORE_LSE=return_lse,
                 USE_TOPK_LENGTH=use_topk_length,
                 BLOCK_H=BLOCK_H,
@@ -264,6 +329,9 @@ def triton_sparse_mla_decode_splitk(
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
             KV_SCALED=kv_scaled,
+            KV_MXFP4=kv_mxfp4,
+            STRIDE_KV_T=stride_kv_t,
+            MXFP4_HW_UNPACK=mxfp4_hw_unpack,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
