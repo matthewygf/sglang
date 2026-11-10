@@ -10,6 +10,7 @@ import logging
 import os
 import socket
 import threading
+from types import SimpleNamespace
 from typing import Any, List, Optional
 
 import torch
@@ -256,6 +257,17 @@ class UMBPStore(HiCacheStorage):
         # cache-group rank, so HiCache's shared-SSD leader/follower deduplication
         # must not be layered on top. Default False preserves the existing
         # HiCache L3 behaviour.
+        self._wholepage_io_lock = threading.Lock()
+        self._wholepage_staging = None
+        self._wholepage_staging_allocator = None
+        self._wholepage_backend_contract_verified = False
+        self._wholepage_staging_cap_bytes = (
+            int(os.getenv("SGLANG_HICACHE_UMBP_WHOLEPAGE_STAGING_MB", "256"))
+            * 1024
+            * 1024
+        )
+        if self._wholepage_staging_cap_bytes <= 0:
+            raise ValueError("UMBP whole-page staging cap must be positive")
         (
             UMBPClient,
             UMBPConfig,
@@ -1366,7 +1378,10 @@ class UMBPStore(HiCacheStorage):
         )
 
         components = getattr(host_pool, "components", None)
-        if pool_name == PoolName.MAMBA:
+        if pool_name == PoolName.MAMBA and self._needs_wholepage_io(host_pool):
+            schema = self._wholepage_schema_digest(host_pool)
+            suffixes = [f"_{mha_suffix}_mamba_wholepage_v2_{schema}"]
+        elif pool_name == PoolName.MAMBA:
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
             suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
@@ -1463,6 +1478,259 @@ class UMBPStore(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
+    @staticmethod
+    def _new_wholepage_shared_allocator():
+        from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+            UMBPHostTensorAllocator,
+        )
+
+        return UMBPHostTensorAllocator()
+
+    @staticmethod
+    def _needs_wholepage_io(host_pool) -> bool:
+        """Pointer-only metadata cannot represent registered PLE slot state."""
+        return bool(getattr(host_pool, "slot_state_device_tensors", ()))
+
+    @staticmethod
+    def _wholepage_schema_digest(host_pool) -> str:
+        """Fingerprint ordered checkpoint views, excluding pool capacity/data."""
+        import hashlib
+        import json
+
+        layout = getattr(host_pool, "layout", None)
+        if not isinstance(layout, str) or not layout:
+            raise ValueError("UMBP whole-page key requires the host serializer layout")
+        page_size = int(getattr(host_pool, "page_size", 1))
+        if page_size <= 0:
+            raise ValueError("UMBP whole-page page_size must be positive")
+        iterator = getattr(host_pool, "_iter_page_tensors", None)
+        if not callable(iterator):
+            raise ValueError(
+                "UMBP whole-page key requires ordered serializer tensor metadata"
+            )
+        tensors = [
+            {"dtype": str(tensor.dtype), "shape": [int(dim) for dim in tensor.shape]}
+            for tensor in iterator(0)
+        ]
+        if not tensors or any(dim < 0 for tensor in tensors for dim in tensor["shape"]):
+            raise ValueError("UMBP whole-page serializer tensor schema is invalid")
+        schema = {
+            "format": "sglang-umbp-mamba-wholepage",
+            "version": 2,
+            "layout": layout,
+            "page_size": page_size,
+            "tensors": tensors,
+        }
+        encoded = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _ensure_wholepage_staging(self) -> torch.Tensor:
+        """Keep one bounded allocation alive for the client's registrations.
+
+        Never resize registered storage: both standalone and distributed clients
+        can retain the registration after a synchronous batch operation returns.
+        The allocation remains owned by this store until the store is destroyed.
+        Caller holds _wholepage_io_lock for the entire serialization/I/O/copy.
+        """
+        if self._wholepage_staging is None:
+            standalone = getattr(self, "_is_standalone_process", False)
+            allocator = None
+            if standalone:
+                # Ordinary torch-pinned storage is not necessarily exportable to
+                # the separate standalone service. This existing allocator uses
+                # AnonymousShm/AnonymousShmHugetlb backing in standalone mode.
+                allocator = self._new_wholepage_shared_allocator()
+                if not getattr(allocator, "_standalone_process", False):
+                    raise RuntimeError(
+                        "UMBP whole-page standalone staging requires an exportable "
+                        "shared-memory allocator; set UMBP_STANDALONE_ADDRESS "
+                        "before allocator construction."
+                    )
+                tensor = allocator.allocate(
+                    (self._wholepage_staging_cap_bytes,),
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+            else:
+                tensor = torch.empty(
+                    self._wholepage_staging_cap_bytes, dtype=torch.uint8, device="cpu"
+                )
+                try:
+                    tensor = tensor.pin_memory()
+                except RuntimeError:
+                    logger.warning(
+                        "UMBP whole-page staging could not be pinned; "
+                        "memory registration may use a slower path or fail."
+                    )
+            # Reuse the adapter's deployment-aware registration checks. Local
+            # embedded mode needs no RDMA registration; standalone-process mode
+            # must register successfully, and distributed mode keeps its existing
+            # documented staging fallback if zero-copy registration is disabled.
+            # Retaining the allocator is essential: it owns and frees the mapping.
+            self._wholepage_staging_allocator = allocator
+            registered = self._register_host_buffer_for_zero_copy(
+                SimpleNamespace(kv_buffer=tensor, allocator=allocator)
+            )
+            if standalone and not registered:
+                raise RuntimeError(
+                    "UMBP whole-page shared staging registration failed in standalone mode"
+                )
+            self._wholepage_staging = tensor
+        return self._wholepage_staging
+
+    def _verify_wholepage_backend_contract(self, staging: torch.Tensor) -> None:
+        """Fail closed unless this actual client rejects incomplete object reads.
+
+        A boolean pointer get might describe destination capacity rather than
+        exact size. Probe a reserved eight-byte object before transferring any
+        real checkpoint. Successful exact-size reads must have completed when
+        the API returns; mismatched reads must fail without changing the guards.
+        """
+        if self._wholepage_backend_contract_verified:
+            return
+        if staging.numel() < 48:
+            raise RuntimeError(
+                "UMBP whole-page backend probe requires 48 staging bytes"
+            )
+        key = (
+            f"{self.config_prefix or 'sglang'}_{self.mha_suffix}"
+            "_umbp_wholepage_size_contract_v1"
+        )
+        payload = [85, 77, 66, 80, 83, 90, 48, 49]  # UMBPSZ01
+        staging[:8].copy_(torch.tensor(payload, dtype=torch.uint8, device="cpu"))
+        written = list(self.client.batch_put_from_ptr([key], [staging.data_ptr()], [8]))
+        if len(written) != 1:
+            raise RuntimeError(
+                "UMBP whole-page backend probe got an invalid put response"
+            )
+        if not written[0]:
+            exists = list(self.client.batch_exists([key]))
+            if len(exists) != 1 or not exists[0]:
+                raise RuntimeError(
+                    "UMBP whole-page backend probe could not store its object"
+                )
+        for requested in (8, 4, 12):
+            staging[16:48].fill_(165)
+            response = list(
+                self.client.batch_get_into_ptr(
+                    [key], [staging.data_ptr() + 24], [requested]
+                )
+            )
+            expected = [165] * 32
+            if requested == 8:
+                expected[8:16] = payload
+            valid_status = len(response) == 1 and bool(response[0]) == (requested == 8)
+            if not valid_status or staging[16:48].tolist() != expected:
+                raise RuntimeError(
+                    "UMBP whole-page path disabled: this client's pointer get "
+                    "does not demonstrate synchronous exact-size reads with "
+                    "unchanged guards on size mismatch."
+                )
+        self._wholepage_backend_contract_verified = True
+        logger.info(
+            "UMBP whole-page backend probe passed: synchronous eight-byte read, "
+            "four/twelve-byte mismatches rejected with unchanged guards"
+        )
+
+    def _wholepage_io_v2(self, transfer: PoolTransfer, is_set: bool) -> list:
+        """Transfer complete Mamba checkpoints, including typed slot side state.
+
+        The client's read/size behavior is checked before using real checkpoints.
+        Failed gets never copy staging bytes into the destination host pool.
+        """
+        host_pool = self.registered_pools[transfer.name]
+        keys = transfer.keys
+        page_size = int(getattr(host_pool, "page_size", 1) or 1)
+        page_bytes = page_size * int(host_pool.size_per_token)
+        if page_bytes <= 0:
+            raise ValueError("UMBP whole-page checkpoint size must be positive")
+        if page_bytes > self._wholepage_staging_cap_bytes:
+            raise ValueError(
+                f"UMBP whole-page checkpoint requires {page_bytes} bytes, "
+                f"exceeding the staging cap {self._wholepage_staging_cap_bytes}; "
+                "increase SGLANG_HICACHE_UMBP_WHOLEPAGE_STAGING_MB."
+            )
+        key_strs, multiplier = self._get_hybrid_page_component_keys(keys, transfer)
+        if multiplier != 1:
+            raise ValueError(
+                "UMBP whole-page format requires one object per checkpoint"
+            )
+        host_indices = transfer.host_indices.detach().to(device="cpu").tolist()
+        pages_per_chunk = self._wholepage_staging_cap_bytes // page_bytes
+        page_results = [False] * len(keys)
+
+        # HiCache can load and back up on different threads. A single registered
+        # staging allocation must not be overwritten by another operation.
+        with self._wholepage_io_lock:
+            staging = self._ensure_wholepage_staging()
+            self._verify_wholepage_backend_contract(staging)
+            if is_set:
+                existing = list(self.client.batch_exists(key_strs))
+                if len(existing) != len(keys):
+                    logger.error("UMBP whole-page exists response has the wrong length")
+                    return page_results
+                page_results = [bool(value) for value in existing]
+                pages = [i for i, exists in enumerate(page_results) if not exists]
+            else:
+                pages = list(range(len(keys)))
+
+            if not pages:
+                return page_results
+            operation = (
+                self.client.batch_put_from_ptr
+                if is_set
+                else self.client.batch_get_into_ptr
+            )
+            for start in range(0, len(pages), pages_per_chunk):
+                chunk = pages[start : start + pages_per_chunk]
+                chunk_keys = [key_strs[page] for page in chunk]
+                ptrs = [staging.data_ptr() + i * page_bytes for i in range(len(chunk))]
+                sizes = [page_bytes] * len(chunk)
+                if is_set:
+                    for i, page in enumerate(chunk):
+                        data_page = host_pool.get_data_page(
+                            host_indices[page * page_size], flat=True
+                        )
+                        if (
+                            data_page.dtype != torch.uint8
+                            or data_page.numel() != page_bytes
+                        ):
+                            raise ValueError(
+                                "UMBP whole-page serializer returned an unexpected "
+                                "dtype or checkpoint byte count"
+                            )
+                        offset = i * page_bytes
+                        staging[offset : offset + page_bytes].copy_(data_page)
+                io_results = [
+                    bool(value) for value in operation(chunk_keys, ptrs, sizes)
+                ]
+                if len(io_results) != len(chunk):
+                    logger.error("UMBP whole-page I/O response has the wrong length")
+                    # Do not apply even an apparently successful partial response.
+                    continue
+                if is_set and not all(io_results):
+                    # Another writer can commit the same immutable prefix after
+                    # the initial probe. Existence makes that duplicate a success;
+                    # a genuine failed write remains a failed page.
+                    failed = [i for i, ok in enumerate(io_results) if not ok]
+                    raced = list(
+                        self.client.batch_exists([chunk_keys[i] for i in failed])
+                    )
+                    if len(raced) == len(failed):
+                        for i, exists in zip(failed, raced):
+                            io_results[i] = bool(exists)
+                for i, (page, ok) in enumerate(zip(chunk, io_results)):
+                    if ok and not is_set:
+                        offset = i * page_bytes
+                        host_pool.set_from_flat_data_page(
+                            host_indices[page * page_size],
+                            staging[offset : offset + page_bytes],
+                        )
+                    page_results[page] = ok
+        return page_results
+
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool) -> dict:
         """Unified per-pool zero-copy I/O. Returns {pool_name: per-page bools}."""
         results: dict = {}
@@ -1481,6 +1749,10 @@ class UMBPStore(HiCacheStorage):
                     f"UMBP v2 pool {transfer.name} has {len(keys)} keys for "
                     f"{len(host_indices)} indices with page_size={page_size}."
                 )
+
+            if transfer.name == PoolName.MAMBA and self._needs_wholepage_io(host_pool):
+                results[transfer.name] = self._wholepage_io_v2(transfer, is_set)
+                continue
 
             key_strs, multiplier = self._get_hybrid_page_component_keys(keys, transfer)
             ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
