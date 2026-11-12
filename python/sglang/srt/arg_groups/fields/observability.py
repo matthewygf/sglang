@@ -231,7 +231,12 @@ class Observability(msgspec.Struct):
     forward_hooks: A[
         Optional[List[dict[str, Any]]],
         Arg(
-            help="JSON-formatted forward hook specifications to attach to the model.",
+            help=(
+                "JSON-formatted forward hook specifications to attach to the model. "
+                "Each spec may set install_phase to post_capture (default) or "
+                "pre_capture for graph-safe interventions installed before warmup. "
+                "Python hooks do not run during graph replay."
+            ),
             type_parser=json_list_type,
         ),
     ] = None
