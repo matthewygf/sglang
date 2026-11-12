@@ -1,19 +1,108 @@
+from __future__ import annotations
+
+import copy
 import fnmatch
 import importlib
 import logging
-from typing import Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
-import torch.nn as nn
+if TYPE_CHECKING:
+    import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
 
-def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
+_INSTALL_PHASES = ("pre_capture", "post_capture")
+
+
+def register_forward_hooks(
+    model: nn.Module,
+    hook_specs: List[dict[str, Any]],
+    *,
+    install_phase: str = "post_capture",
+) -> None:
     """
     hook_specs is a list of dicts from server_args.forward_hooks.
-    Attaches forward hooks to the matching modules.
+    Attaches forward hooks to the matching modules once per model and phase.
+
+    The default is post_capture, preserving hook-free graph capture. Explicit
+    pre_capture factories may install graph-safe numerical interventions before
+    warmup; their hooks also run during warmup/capture, not during graph replay.
+    Factories retain the factory(config) interface. Recapture must not run a
+    factory again or attach duplicate hooks. Changing installed specifications
+    requires a new model instance.
     """
+    if install_phase not in _INSTALL_PHASES:
+        raise ValueError(f"Unknown forward hook install phase: {install_phase!r}")
+    # Validate the entire specification before invoking any factory, including
+    # specs for the later phase: a typo must not leave partial interventions.
+    for spec in hook_specs:
+        phase = spec.get("install_phase", "post_capture")
+        if phase not in _INSTALL_PHASES:
+            raise ValueError(
+                f"Unknown install_phase {phase!r} for forward hook "
+                f"{spec.get('name', '')!r}; expected one of {_INSTALL_PHASES}"
+            )
+    selected = [
+        spec
+        for spec in hook_specs
+        if spec.get("install_phase", "post_capture") == install_phase
+    ]
+    installations = getattr(model, "_sglang_forward_hook_installations", None)
+    previous = installations.get(install_phase) if installations is not None else None
+    if previous is not None:
+        if previous["specs"] != selected:
+            raise ValueError(
+                "Forward hook specifications changed after "
+                f"{install_phase} installation"
+            )
+        if previous["status"] != "installed":
+            raise RuntimeError(
+                f"Forward hook {install_phase} installation already started or failed; "
+                "use a new model instance"
+            )
+        return
+
+    if not selected:
+        return
+    if installations is None:
+        installations = {}
+        model._sglang_forward_hook_installations = installations
+    installation = {"specs": copy.deepcopy(selected), "status": "installing"}
+    installations[install_phase] = installation
+    try:
+        _register_selected_forward_hooks(
+            model, selected, require_matches=install_phase == "pre_capture"
+        )
+    except BaseException:
+        # A factory can have side effects beyond registered handles. Do not
+        # retry a partial installation against the same model.
+        installation["status"] = "failed"
+        raise
+    installation["status"] = "installed"
+
+
+def _register_selected_forward_hooks(
+    model: nn.Module,
+    hook_specs: List[dict[str, Any]],
+    *,
+    require_matches: bool,
+) -> None:
     name_to_module = dict(model.named_modules())
+    if require_matches:
+        # Opt-in numerical factories must not silently run without the intended
+        # targets. Preflight all targets before invoking any such factory.
+        for spec in hook_specs:
+            patterns = spec.get("target_modules", [])
+            if not spec.get("hook_factory") or not any(
+                fnmatch.fnmatch(name, pattern)
+                for name in name_to_module
+                for pattern in patterns
+            ):
+                raise ValueError(
+                    f"Pre-capture hook {spec.get('name', '')!r} requires a "
+                    "hook_factory and matching target_modules"
+                )
 
     for spec in hook_specs:
         spec_name = spec.get("name", "")
