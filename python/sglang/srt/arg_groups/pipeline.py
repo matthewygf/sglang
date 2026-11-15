@@ -45,6 +45,16 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
+    from sglang.srt.mem_cache.mxfp4_validation import validate_mxfp4_args
+    from sglang.srt.runtime_context import get_platform
+
+    # Reject explicit incompatible flags before handlers can reset them.
+    if (
+        server_args.kv_cache_dtype == "mxfp4"
+        or server_args.speculative_draft_kv_cache_dtype == "mxfp4"
+    ):
+        validate_mxfp4_args(server_args, is_hip=get_platform().is_hip)
+
     from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
 
     # Before any handler reads the DP layout.
@@ -385,5 +395,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    if cfg.kv_cache_dtype == "mxfp4":
+        from sglang.srt.arg_groups.model_override_base import model_config_of
+        from sglang.srt.mem_cache.mxfp4_validation import validate_mxfp4_model
+
+        # Backend aliases and page-size defaults are final at this point.
+        validate_mxfp4_args(cfg, is_hip=get_platform().is_hip, final=True)
+        validate_mxfp4_model(model_config_of(server_args))
 
     server_args._resolution_finished = True
