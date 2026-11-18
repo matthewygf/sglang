@@ -38,8 +38,10 @@ def _write_mxfp4_rows(
     ratio = tl.where(amax > 0, amax / 6.0, 1.0)
     bits = ratio.to(tl.int32, bitcast=True)
     exponent = ((bits >> 23) & 255) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    # Groups needing scale <= 2^-31 flush as zero; FP8 also loses most of them.
+    flush = (amax > 0) & (exponent < -30)
     finite = tl.sum((tl.abs(x) < float("inf")).to(tl.int32), 0) == 512
-    bounded = tl.sum(((exponent >= -30) & (exponent <= 30)).to(tl.int32), 0) == 16
+    bounded = tl.sum((exponent <= 30).to(tl.int32), 0) == 16
     rc = tl.arange(0, 64)
     rope_value = tl.load(R + row * RS + rc * RC, valid, 0)
     rope_finite = tl.sum(
@@ -50,10 +52,11 @@ def _write_mxfp4_rows(
     # including graph replay. Mask stores too: bad rows never become cache data.
     tl.device_assert(
         (~valid) | row_ok,
-        "native MXFP4 requires finite BF16 and scale exponents [-30,30]",
+        "native MXFP4 requires finite BF16 and scale exponents <= 30",
     )
     valid = valid & row_ok
-    encoded = tl.where(amax == 0, 127, exponent + 127)
+    encoded = tl.where((amax == 0) | flush, 127, exponent + 127)
+    grouped = tl.where(flush[:, None], 0.0, grouped)
     scale = (encoded << 23).to(tl.float32, bitcast=True)
     normalized = tl.reshape(grouped / scale[:, None], (512,))
     a = tl.abs(normalized)
@@ -85,7 +88,8 @@ def set_mla_kv_buffer_mxfp4(
 
     Real physical locations must be unique within a scheduler write; only the
     reserved padding location zero may repeat. Device checks do not host-sync
-    or inspect padded inputs, and reject nonfinite/out-of-domain real rows.
+    or inspect padded inputs, and reject nonfinite/overflowing real rows;
+    underflowing 32-value groups are stored as zero.
     """
     if cache.dtype != torch.uint8 or cache.ndim != 3 or cache.shape[1:] != (1, 400):
         raise ValueError("native MXFP4 cache requires uint8 [capacity,1,400]")
