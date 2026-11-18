@@ -156,11 +156,20 @@ _is_gfx1250_supported = is_gfx1250_supported()
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
 _use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
 if _use_aiter and not _use_aiter_preshuffle:
-    logger.warning(
-        "ROCm DSA indexer: aiter preshuffle paged-MQA path is unavailable "
-        "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
-        "falling back to legacy page_size=1 / KVBlockSize=1 path."
-    )
+    if envs.SGLANG_DSA_HIP_DISABLE_PRESHUFFLE.get():
+        # An explicit kill-switch is a decision, not a capability gap. Reporting
+        # it as a Triton/AOT failure would send the reader chasing a toolchain
+        # problem that does not exist.
+        logger.info(
+            "ROCm DSA indexer: using legacy page_size=1 / KVBlockSize=1 path "
+            "because SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 was set."
+        )
+    else:
+        logger.warning(
+            "ROCm DSA indexer: aiter preshuffle paged-MQA path is unavailable "
+            "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
+            "falling back to legacy page_size=1 / KVBlockSize=1 path."
+        )
 if _is_cuda:
     try:
         import deep_gemm
