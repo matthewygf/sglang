@@ -2,7 +2,9 @@
 """Pure launch guards for the native Kimi-K3.1 packed latent KV cache."""
 
 
-def validate_mxfp4_args(cfg, *, is_hip: bool, final: bool = False) -> None:
+def validate_mxfp4_args(
+    cfg, *, is_hip: bool, final: bool = False, native_page64: bool = False
+) -> None:
     if cfg.speculative_draft_kv_cache_dtype == "mxfp4":
         raise ValueError("MXFP4 KV cache does not support speculative draft pools.")
     if cfg.kv_cache_dtype != "mxfp4":
@@ -59,8 +61,22 @@ def validate_mxfp4_args(cfg, *, is_hip: bool, final: bool = False) -> None:
     rejected = [flag for flag, enabled in unsupported.items() if enabled]
     if rejected:
         raise ValueError("MXFP4 KV cache does not support " + ", ".join(rejected) + ".")
-    if cfg.page_size != 1 and (final or cfg.page_size is not None):
-        raise ValueError("MXFP4 KV cache requires --page-size 1.")
+    if cfg.page_size != (64 if native_page64 else 1) and (
+        final or cfg.page_size is not None
+    ):
+        raise ValueError(
+            "MXFP4 KV cache requires --page-size 1 (legacy) or explicit "
+            "--page-size 64 with AITER preshuffle available."
+        )
+    if native_page64 and cfg.dsa_paged_mqa_logits_backend not in ("auto", "aiter"):
+        raise ValueError(
+            "MXFP4 page 64 requires --dsa-paged-mqa-logits-backend auto or aiter."
+        )
+    if native_page64 and (cfg.enable_dsa_fp4_indexer or cfg.enable_amd_monokernel):
+        raise ValueError(
+            "MXFP4 page 64 requires the FP8 AITER indexer, not "
+            "--enable-dsa-fp4-indexer or --enable-amd-monokernel."
+        )
     for field in (
         "attention_backend",
         "prefill_attention_backend",

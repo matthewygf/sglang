@@ -4833,11 +4833,16 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             or self.dtype != torch.uint8
             or self.kv_lora_rank != 512
             or self.qk_rope_head_dim != 64
-            or self.page_size != 1
+            or self.page_size not in (1, 64)
+            or (
+                self.page_size == 64
+                and (self.size % 64 != 0 or not aiter_can_use_preshuffle_paged_mqa())
+            )
             or get_parallel().attn_dcp_size != 1
         ):
             raise ValueError(
-                "native MXFP4 requires DSA, 512 latent, 64 RoPE, page_size=1, DCP1"
+                "native MXFP4 requires DSA, 512 latent, 64 RoPE, DCP1 and either "
+                "page_size=1 or aligned page_size=64 with AITER preshuffle"
             )
 
     def _reject_native_mxfp4(self, operation):
@@ -5393,7 +5398,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         kv_scale_ue8m0: bool = False,
     ):
         if dtype == torch.uint8 and (
-            index_kpool != 1 or index_kpool_compress or index_head_dim != 128
+            index_kpool != 1
+            or index_kpool_compress
+            or index_head_dim != 128
+            or (page_size == 64 and get_exec().kernel.enable_dsa_fp4_indexer)
         ):
             raise ValueError(
                 "native MXFP4 requires the unchanged, uncompressed FP8 DSA index cache"
