@@ -1694,7 +1694,6 @@ class Envs:
     # Largest M the startup bf16 GEMM warmup covers (the prefill chunk; about
     # 13 s of startup on K3.1); 0 disables it.
     SGLANG_WARMUP_BF16_GEMM_MAX_M = EnvInt(16384)
-    SGLANG_MXFP4_PREFILL_WARMUP = EnvBool(True)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.

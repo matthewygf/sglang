@@ -133,9 +133,6 @@ from sglang.srt.model_executor.graph_memory_usage import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner_components import misc_utils
-from sglang.srt.model_executor.model_runner_components.mxfp4_prefill_warmup import (
-    maybe_warmup_mxfp4_sparse_prefill,
-)
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
     configure_aux_hidden_state_capture,
@@ -782,7 +779,6 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
-        maybe_warmup_mxfp4_sparse_prefill(self)
         # after every post-load change to the model, before the KV cache is sized
         install_megakernel(
             model=self.model,
