@@ -486,7 +486,22 @@ def _prune_configs(configs, named_args, **kwargs):
         for c in candidates
         if c.kwargs["BLOCK_N"] <= topk and c.kwargs["BLOCK_N"] <= max_block_n
     ]
-    return keep or [candidates[0]]
+    legal = keep or [candidates[0]]
+    # Pin to one configuration so Triton's autotuner takes its single-survivor
+    # path and never benchmarks at serving time. BLOCK_N=32 / num_warps=2 is the
+    # measured win for the native MXFP4 path; the FP8-dot path prunes stages=3,
+    # so it falls back to stages=2 there.
+    preferred = (32, 2, 2 if kwargs["USE_FP8_DOT"] else 3)
+    return [
+        next(
+            (
+                c
+                for c in legal
+                if (c.kwargs["BLOCK_N"], c.num_warps, c.num_stages) == preferred
+            ),
+            legal[0],
+        )
+    ]
 
 
 _LONG_PREFILL_SEQ_THRESHOLD = 32768
