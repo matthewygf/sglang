@@ -27,6 +27,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
@@ -401,6 +402,18 @@ def capture_cuda_graphs(
 
     """
 
+    # Numerical interventions must be installed before any eager warmup or
+    # graph capture. Pool/backend access is available to these factories even
+    # though there is no live request or ForwardBatch yet. Default observation
+    # hooks remain post-capture and do not enter the recorded graph.
+    if get_observability().forward_hooks:
+        with forward_context(ForwardContext(attn_backend=model_runner.attn_backend)):
+            register_forward_hooks(
+                model_runner.model,
+                get_observability().forward_hooks,
+                install_phase="pre_capture",
+            )
+
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )
@@ -453,12 +466,14 @@ def capture_cuda_graphs(
 
 def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
     """Run setup that must happen after the final graph capture."""
-    # Register forward hooks AFTER cuda-graph capture so their tensor ops are
-    # not traced into any captured graph — capture stays hook-free and hooks
-    # fire only on the eager forward path (capture replay never runs Python
-    # hooks anyway).
+    # Default observation hooks stay outside capture. Explicit pre-capture
+    # factories have already run; replay never invokes Python forward hooks.
     if get_observability().forward_hooks:
-        register_forward_hooks(model_runner.model, get_observability().forward_hooks)
+        register_forward_hooks(
+            model_runner.model,
+            get_observability().forward_hooks,
+            install_phase="post_capture",
+        )
 
     prealloc_symmetric_memory_pool(
         is_draft_worker=model_runner.is_draft_worker,

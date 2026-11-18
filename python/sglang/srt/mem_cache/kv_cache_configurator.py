@@ -3602,6 +3602,19 @@ def calculate_mla_kv_cache_dim(
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
+    if kv_cache_dtype == torch.uint8:
+        from sglang.srt.mem_cache.mxfp4_validation import validate_mxfp4_model
+
+        if (
+            not _is_hip
+            or get_model().kv_cache_dtype != "mxfp4"
+            or get_exec().kernel.dsa_prefill_backend != "triton"
+            or get_exec().kernel.dsa_decode_backend != "triton"
+        ):
+            raise ValueError("uint8 MLA storage requires ROCm Triton DSA with mxfp4.")
+        validate_mxfp4_model(model_config)
+        return 400
+
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
