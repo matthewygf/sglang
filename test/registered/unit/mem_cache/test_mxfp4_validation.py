@@ -7,7 +7,9 @@ already accepts the packed format. This file pins the two properties that matter
 after removing it:
 
 1. radix on and radix off are both admitted, in both validator modes;
-2. every other guard in the same function still rejects.
+2. the guards sampled below still reject, so the change does not silently widen
+the MXFP4 envelope. These are a representative floor, not exhaustive coverage of
+the ``unsupported`` dict.
 
     python -m pytest test/registered/unit/mem_cache/test_mxfp4_validation.py -v
 """
@@ -96,10 +98,20 @@ def test_native_device_radix_is_admitted(disable_radix_cache, final):
             "does not support --enable-session-radix-cache",
         ),
         ("radix_cache_backend", "custom", "does not support --radix-cache-backend"),
+        ("enable_hisparse", True, "does not support --enable-hisparse"),
+        ("enable_lmcache", True, "does not support --enable-lmcache"),
+        ("enable_unified_memory", True, "does not support --enable-unified-memory"),
+        ("disaggregation_mode", "prefill", "does not support --disaggregation-mode"),
+        ("speculative_algorithm", "EAGLE", "does not support --speculative-algorithm"),
         (
             "dsa_prefill_backend",
             "triton_sparse_mla",
             "requires --dsa-prefill-backend triton",
+        ),
+        (
+            "dsa_decode_backend",
+            "triton_sparse_mla",
+            "requires --dsa-decode-backend triton",
         ),
     ],
 )
