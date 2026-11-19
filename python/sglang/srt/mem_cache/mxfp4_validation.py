@@ -15,10 +15,6 @@ def validate_mxfp4_args(cfg, *, is_hip: bool, final: bool = False) -> None:
         raise ValueError(
             "MXFP4 KV cache requires DCP1 and no prefill context parallelism."
         )
-    if not cfg.disable_radix_cache:
-        raise ValueError(
-            "MXFP4 KV cache requires --disable-radix-cache (no prefix cache)."
-        )
 
     unsupported = {
         "--enable-hisparse": cfg.enable_hisparse,
