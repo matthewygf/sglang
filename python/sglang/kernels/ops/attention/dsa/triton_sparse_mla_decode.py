@@ -8,13 +8,14 @@ on DSA shapes:
   output:  [1, bs, H, D_V]  bf16
 """
 
+from typing import Literal
+
 import torch
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _FP8_MAX,
     _LOG2E,
     _PREFERRED_BLOCK_K,
-    _as_scaled_fp8_kv,
     _cu_count,
     _gfx950_sparse_mla_kv_splits,
     _gfx950_sparse_mla_num_warps,
@@ -23,13 +24,13 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _next_pow2,
     _no_async_copy,
     _page_offsets_fit_i32,
+    _prepare_mla_kv_format,
     _reduce_d_chunk,
     _row_strides,
     _sparse_mla_block_k,
     _sparse_mla_fused_kernel,
     _sparse_mla_reduce_kernel,
     _sparse_mla_split_k_kernel,
-    _validate_input_dtypes,
 )
 
 _SplitKWorkspace = list[tuple[torch.Tensor, torch.Tensor]]
@@ -90,6 +91,8 @@ def triton_sparse_mla_decode_splitk(
     lengths: torch.Tensor | None = None,
     expected_topk: int | None = None,
     natural_lse: bool = False,
+    kv_format: Literal["auto", "mxfp4"] = "auto",
+    mxfp4_unpack: Literal["auto", "software", "gfx950"] = "auto",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
@@ -104,10 +107,25 @@ def triton_sparse_mla_decode_splitk(
              transform_index_page_table_dcp (transform_index.py) or dcp_local_topk.
     expected_topk: typical lengths value, which sizes the split count instead of topk
     natural_lse: return the LSE in natural log, -inf for a row with no key
+    kv_format: "auto" preserves the existing BF16/raw-FP8/scaled-FP8 layout
+        selection. Experimental "mxfp4" requires BF16 queries and uint8
+        [num_pages, 1, 400] rows: 256 E2M1 payload bytes, 16 group-32 E8M0
+        scales, then 128 BF16 RoPE bytes. The low nibble is the even element.
+        Row padding is supported with a unit byte-column stride and an even
+        physical row stride >= 400. This bounded-codec experiment requires
+        finite values and E8M0 exponents in [-30, 30], a caller-validated
+        content precondition. The native pool writer enforces this domain;
+        external callers must validate their rows. No whole-cache reconstruction
+        is made.
+    mxfp4_unpack: experimental MXFP4 reader selection for validation/ablation;
+        "auto" uses the native pair converter on gfx950 and software elsewhere.
+        Both reconstruct the same BF16 operands. "gfx950" requires that device.
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
-    kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
-    is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
+    kv, kv_scaled, is_fp8, stride_kv_t, mxfp4_hw_unpack = _prepare_mla_kv_format(
+        q_nope, q_rope, kv, d_v, kv_format, mxfp4_unpack
+    )
+    kv_mxfp4 = kv_format == "mxfp4"
     use_fp8_dot = is_fp8 and not kv_scaled
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
@@ -217,6 +235,9 @@ def triton_sparse_mla_decode_splitk(
                 USE_TOPK_LENGTH=lengths is not None,
                 TOPK_TAIL_INVALID=lengths is not None,
                 KV_SCALED=kv_scaled,
+                KV_MXFP4=kv_mxfp4,
+                STRIDE_KV_T=stride_kv_t,
+                MXFP4_HW_UNPACK=mxfp4_hw_unpack,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (
@@ -275,6 +296,9 @@ def triton_sparse_mla_decode_splitk(
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
+            KV_MXFP4=kv_mxfp4,
+            STRIDE_KV_T=stride_kv_t,
+            MXFP4_HW_UNPACK=mxfp4_hw_unpack,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
