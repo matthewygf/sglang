@@ -4910,10 +4910,12 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
         self.dcp_replicated = dcp_replicated
+        # Out-of-tree pools can register unrelated layouts with uint8 storage.
+        native_uint8 = dtype == torch.uint8 and not current_platform.is_out_of_tree()
         self.dsa_kv_cache_store_mxfp4 = (
-            use_dsa and dtype == torch.uint8 and override_kv_cache_dim == 400
+            native_uint8 and use_dsa and override_kv_cache_dim == 400
         )
-        if dtype == torch.uint8 and not self.dsa_kv_cache_store_mxfp4:
+        if native_uint8 and not self.dsa_kv_cache_store_mxfp4:
             raise ValueError("native MXFP4 requires DSA, uint8, and a 400-byte row")
         if self.dsa_kv_cache_store_mxfp4:
             self._check_native_mxfp4_layout()
@@ -5553,7 +5555,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
     ):
-        if dtype == torch.uint8 and (
+        if dtype == torch.uint8 and not current_platform.is_out_of_tree() and (
             index_kpool != 1
             or index_kpool_compress
             or index_head_dim != 128

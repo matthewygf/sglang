@@ -88,6 +88,15 @@ def _rocm_page_geometry_on_cpu(monkeypatch, page_size):
     )
 
 
+def test_platform_uint8_pool_does_not_select_native_codec(runtime, monkeypatch):
+    _rocm_page_geometry_on_cpu(monkeypatch, 1)
+    monkeypatch.setattr(memory_pool.current_platform, "is_out_of_tree", lambda: True)
+    with runtime("cpu"):
+        pool = _pool("cpu")
+        assert not pool.dsa_kv_cache_store_mxfp4
+        assert pool.kv_cache_dim == 512 + 64
+
+
 def test_mxfp4_non_descriptor_guards(runtime, monkeypatch):
     _rocm_page_geometry_on_cpu(monkeypatch, 1)
     with runtime("cpu"):
