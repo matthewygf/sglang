@@ -334,6 +334,70 @@ def _keys_reference(q, keys, idx, sm_scale):
     return out, lse
 
 
+@pytest.mark.parametrize("hardware", [False, True], ids=["software", "gfx950"])
+@pytest.mark.parametrize(
+    "reader,natural",
+    [
+        ("split_dim", True),
+        ("fused", False),
+        ("fused", True),
+        ("split_k", False),
+        ("split_k", True),
+    ],
+)
+def test_mxfp4_reader_matches_dense_keys(monkeypatch, reader, natural, hardware):
+    from sglang.kernels.ops.attention.dsa import triton_sparse_mla as mla
+
+    if hardware and not mla._mxfp4_hw_unpack_supported(torch.cuda.current_device()):
+        pytest.skip("native pair conversion requires gfx950")
+    monkeypatch.setattr(mla, "_mxfp4_hw_unpack_supported", lambda _: hardware)
+    torch.manual_seed(31)
+    device = "cuda"
+    # Deliberate row padding would be read as the next slot with a 400-byte stride.
+    pages = torch.full((96, 1, 416), 0xFF, dtype=torch.uint8, device=device)
+    rows = pages[..., :400]
+    codes = torch.randint(16, (96, 512), device=device)
+    exponents = torch.randint(-3, 1, (96, 16), device=device)
+    rope = torch.randn(96, 64, device=device, dtype=torch.bfloat16)
+    rows[:, 0, :256] = codes[:, ::2] | (codes[:, 1::2] << 4)
+    rows[:, 0, 256:272] = exponents + 127
+    rows[:, 0, 272:] = rope.view(torch.uint8)
+    e2m1 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
+    latent = e2m1[codes & 7] * torch.where(codes < 8, 1, -1)
+    latent = latent * exponents.float().exp2().repeat_interleave(32, 1)
+    keys = torch.cat((latent, rope), 1)
+    lengths = torch.tensor([65, 0, 1], dtype=torch.int32, device=device)
+    idx = torch.full((3, 128), -1, dtype=torch.int32, device=device)
+    idx[0, :65] = torch.randperm(96, device=device)[:65]
+    idx[2, 0] = 90
+    q = torch.randn(3, 12, 576, device=device, dtype=torch.bfloat16)
+    scale = 576**-0.5
+    args = (q[..., :512], q[..., 512:], rows, idx.unsqueeze(1), scale)
+    if reader == "split_dim":
+        out, lse = mla._triton_sparse_mla_fwd_single(
+            *args, return_lse=True, kv_format="mxfp4"
+        )
+    else:
+        out, lse = triton_sparse_mla_decode_splitk(
+            *args,
+            lengths=lengths,
+            kv_splits=1 if reader == "fused" else 2,
+            return_lse=True,
+            natural_lse=natural,
+            kv_format="mxfp4",
+        )
+    expected, log_e = _keys_reference(q.float(), keys, idx, scale)
+    torch.testing.assert_close(out[0].float(), expected, rtol=0, atol=3e-2)
+    keep = lengths > 0
+    log_ref = log_e if natural else log_e / math.log(2)
+    torch.testing.assert_close(lse[keep], log_ref[keep], rtol=0, atol=1e-3)
+    assert torch.all(out[0, ~keep] == 0)
+    if natural:
+        assert torch.isneginf(lse[~keep]).all()
+    else:
+        assert torch.isfinite(lse[~keep]).all() and (lse[~keep] < -1e8).all()
+
+
 def _decode_reference(qn, qr, idx, kd, sm, mxfp8_q=True):
     """FP32 attention using the production MXFP8 Q quantizer and dequantized KV."""
     R, H, _ = qn.shape
