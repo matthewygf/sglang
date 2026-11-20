@@ -247,25 +247,73 @@ def test_mxfp4_draft_is_rejected_even_for_other_target():
         validate_mxfp4_args(cfg, is_hip=True, final=True)
 
 
+def test_in_tree_uint8_row_sizing_requires_the_native_recipe(monkeypatch):
+    import torch
+
+    from sglang.srt.mem_cache import kv_cache_configurator as pools
+    from sglang.srt.mem_cache import kv_cache_dtype as dtypes
+
+    cfg = config()
+    hf = SimpleNamespace(
+        architectures=["KimiK31ForConditionalGeneration"],
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=32,
+        index_rope_dim=0,
+    )
+    model = SimpleNamespace(
+        hf_config=hf,
+        hf_text_config=hf,
+        dtype=torch.bfloat16,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    monkeypatch.setattr(dtypes, "_is_hip", True)
+    monkeypatch.setattr(pools, "_is_hip", True)
+    monkeypatch.setattr(pools, "get_model", lambda: cfg)
+    monkeypatch.setattr(pools, "get_exec", lambda: SimpleNamespace(kernel=cfg))
+    recipe, storage = dtypes.configure_kv_cache_dtype(
+        server_args_kv_cache_dtype="mxfp4",
+        quant_config=None,
+        model_dtype=model.dtype,
+        is_draft_worker=False,
+        is_dflash=False,
+        speculative_draft_attention_backend=None,
+    )
+    assert (recipe, storage) == ("mxfp4", torch.uint8)
+    row_bytes = pools.calculate_mla_kv_cache_dim(
+        model_config=model, kv_cache_dtype=storage
+    )
+    assert row_bytes == 400
+    cfg.kv_cache_dtype = "auto"
+    with pytest.raises(ValueError, match="requires ROCm Triton DSA with mxfp4"):
+        pools.calculate_mla_kv_cache_dim(model_config=model, kv_cache_dtype=storage)
+
+
 def test_native_qualification_cli():
-    from sglang.srt.mem_cache.platform_kv_cache_dtype import registered_kv_cache_storage_dtype
+    from sglang.srt.mem_cache.platform_kv_cache_dtype import (
+        registered_kv_cache_storage_dtype,
+    )
     from sglang.srt.server_args import prepare_server_args
 
-    args = prepare_server_args([
-        "--model-path", "/models/kimi-k31", "--kv-cache-dtype", "mxfp4",
-        "--page-size", "64", "--enable-hierarchical-cache", "--enable-metrics",
-        "--max-mamba-cache-size", "32",
-    ])
-    assert (args.kv_cache_dtype, args.page_size, args.max_mamba_cache_size) == ("mxfp4", 64, 32)
+    args = prepare_server_args(
+        "--model-path /models/kimi-k31 --kv-cache-dtype mxfp4 --page-size 64 "
+        "--enable-hierarchical-cache --enable-metrics --max-mamba-cache-size 32".split()
+    )
+    assert args.kv_cache_dtype == "mxfp4"
+    assert args.page_size == 64 and args.max_mamba_cache_size == 32
     assert args.enable_hierarchical_cache and args.enable_metrics
     assert registered_kv_cache_storage_dtype("mxfp4") is None
 
 
-@pytest.mark.parametrize("flag", [
-    "--speculative-accept-threshold-single=1.0",  # even an explicit default
-    "--speculative-use-rejection-sampling",
-    "--no-speculative-enable-w4a4-mxfp4-megamoe",
-])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--speculative-accept-threshold-single=1.0",  # even an explicit default
+        "--speculative-use-rejection-sampling",
+        "--no-speculative-enable-w4a4-mxfp4-megamoe",
+    ],
+)
 def test_speculative_cli_options_rejected(flag):
     from sglang.srt.server_args import prepare_server_args
 

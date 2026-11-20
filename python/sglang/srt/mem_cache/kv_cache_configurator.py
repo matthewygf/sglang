@@ -3896,11 +3896,12 @@ def calculate_mla_kv_cache_dim(
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
-    if kv_cache_dtype == torch.uint8 and get_model().kv_cache_dtype == "mxfp4":
+    if kv_cache_dtype == torch.uint8 and not current_platform.is_out_of_tree():
         from sglang.srt.mem_cache.mxfp4_validation import validate_mxfp4_model
 
         if (
             not _is_hip
+            or get_model().kv_cache_dtype != "mxfp4"
             or get_exec().kernel.dsa_prefill_backend != "triton"
             or get_exec().kernel.dsa_decode_backend != "triton"
         ):
