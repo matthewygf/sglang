@@ -58,6 +58,46 @@ class TestFusedAbsorbGate(CustomTestCase):
         forward_mla_rocm._use_aiter_gfx95 = True
         self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx95", self._saved)
 
+    def test_native_mxfp4_uses_its_pool_writer(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+            forward_mha_rocm,
+        )
+
+        attn = _attn(kv_cache_dtype="mxfp4", attn_mha=SimpleNamespace(layer_id=0))
+        kernel = SimpleNamespace(
+            dsa_decode_backend="triton", dsa_prefill_backend="triton"
+        )
+        gate = (
+            forward_mla_rocm.DeepseekMLARocmForwardMixin._skip_rope_for_dsa_tilelang_fused
+        )
+        with mock.patch.object(
+            forward_mla_rocm, "get_exec", return_value=SimpleNamespace(kernel=kernel)
+        ):
+            self.assertFalse(gate(attn))
+            self.assertTrue(gate(_attn(kv_cache_dtype="fp8_e4m3")))
+
+        # Without AITER, prefix-free dense prefill must still write the separate
+        # BF16 tensors through store_mla, not store a combined raw row.
+        kv = torch.zeros(1, 512, dtype=torch.bfloat16)
+        rope = torch.zeros(1, 1, 64, dtype=torch.bfloat16)
+        batch = SimpleNamespace(
+            out_cache_loc=torch.tensor([3]), out_cache_loc_is_physical=False
+        )
+        with (
+            mock.patch.object(forward_mha_rocm, "_use_aiter_gfx95", False),
+            mock.patch.object(forward_mha_rocm, "get_kv_layers") as layers,
+        ):
+            forward_mha_rocm.DeepseekMHARocmForwardMixin._set_mla_kv_buffer_rocm(
+                attn, None, kv, rope, batch
+            )
+        layers.return_value.layer.assert_called_once_with(0)
+        view = layers.return_value.layer.return_value
+        view.store.assert_not_called()
+        view.store_mla.assert_called_once()
+        _, _, latent, tail = view.store_mla.call_args.args
+        torch.testing.assert_close(latent, kv.unsqueeze(1))
+        self.assertIs(tail, rope)
+
     def test_dcp_turns_it_off(self):
         """DCP decode all-gathers q_nope_out, which this path never produces.
 

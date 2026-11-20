@@ -1302,6 +1302,7 @@ class DeepseekMLARocmForwardMixin:
             _use_aiter_gfx95
             and self.dcp_size == 1
             and self.current_attention_backend == "dsa"
+            and self.kv_cache_dtype != "mxfp4"  # AITER cannot write the 400-byte row.
             and (
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")
                 or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")

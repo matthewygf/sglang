@@ -326,7 +326,7 @@ class DeepseekMHARocmForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 or self.kv_cache_dtype == "mxfp4":
             get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),
