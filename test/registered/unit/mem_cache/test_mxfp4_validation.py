@@ -64,6 +64,9 @@ def config(**changes):
         decode_attention_backend=None,
         dsa_prefill_backend="triton",
         dsa_decode_backend="triton",
+        dsa_paged_mqa_logits_backend="auto",
+        enable_dsa_fp4_indexer=False,
+        enable_amd_monokernel=False,
     )
     for key, value in changes.items():
         assert hasattr(cfg, key), f"unknown config field {key!r}"
@@ -78,6 +81,73 @@ def test_native_device_radix_is_admitted(disable_radix_cache, final):
     validate_mxfp4_args(
         config(disable_radix_cache=disable_radix_cache), is_hip=True, final=final
     )
+
+
+@pytest.mark.parametrize(
+    ("requested_page", "preshuffle", "model_page", "expected_page"),
+    [
+        (None, False, None, 1),
+        (1, False, None, 1),
+        (64, True, 64, 64),
+        (64, False, None, None),
+        (None, True, 64, None),
+    ],
+    ids=["default", "legacy", "opt-in", "preshuffle-disabled", "model-override"],
+)
+def test_native_page_size_resolution(
+    monkeypatch, requested_page, preshuffle, model_page, expected_page
+):
+    from sglang.srt.arg_groups import (
+        cuda_graph_hook,
+        model_override_base,
+        muse_spark_hook,
+        pipeline,
+    )
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
+    from sglang.srt.layers.attention.dsa import utils as dsa_utils
+    from sglang.srt.mem_cache import mxfp4_validation
+    from sglang.srt.runtime_context import override_platform
+    from sglang.srt.server_args import ServerArgs
+
+    monkeypatch.delenv("SGLANG_AITER_KV_CACHE_LAYOUT", raising=False)
+    monkeypatch.setattr(
+        dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: preshuffle
+    )
+    monkeypatch.setattr(muse_spark_hook, "apply_muse_spark_env_defaults", lambda _: None)
+    monkeypatch.setattr(
+        cuda_graph_hook, "finalize_cuda_graph_prefill_max_context", lambda _: None
+    )
+    monkeypatch.setattr(mxfp4_validation, "validate_mxfp4_model", lambda _: None)
+    monkeypatch.setattr(model_override_base, "model_config_of", lambda _: None)
+
+    # Run the real default and final validation without fetching a checkpoint.
+    def model_override(hook, args):
+        if (
+            hook.__name__ == "handle_model_specific_adjustments"
+            and model_page is not None
+        ):
+            declare_resolution(args, "test.model_override", page_size=model_page)
+
+    monkeypatch.setattr(pipeline, "run_hook", model_override)
+    args = ServerArgs(
+        model_path="/models/kimi-k31",
+        device="cuda",
+        kv_cache_dtype="mxfp4",
+        page_size=requested_page,
+        boundary_reduction="rs+rsv",
+        attention_backend="dsa",
+        dsa_prefill_backend="triton",
+        dsa_decode_backend="triton",
+    )
+    with override_platform(is_hip=True):
+        if expected_page is None:
+            with pytest.raises(
+                ValueError, match="explicit --page-size 64 with AITER preshuffle"
+            ):
+                args.resolve_once()
+        else:
+            args.resolve_once()
+            assert resolution_result(args, "page_size") == expected_page
 
 
 @pytest.mark.parametrize(

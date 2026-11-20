@@ -48,12 +48,24 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.mem_cache.mxfp4_validation import validate_mxfp4_args
     from sglang.srt.runtime_context import get_platform
 
+    # Remember the raw opt-in: a model override resolving an unset page to 64
+    # must not silently switch an existing native launch to a different indexer.
+    native_page64 = False
+    if server_args.kv_cache_dtype == "mxfp4" and server_args.page_size == 64:
+        from sglang.srt.layers.attention.dsa.utils import (
+            aiter_can_use_preshuffle_paged_mqa,
+        )
+
+        native_page64 = aiter_can_use_preshuffle_paged_mqa()
+
     # Reject explicit incompatible flags before handlers can reset them.
     if (
         server_args.kv_cache_dtype == "mxfp4"
         or server_args.speculative_draft_kv_cache_dtype == "mxfp4"
     ):
-        validate_mxfp4_args(server_args, is_hip=get_platform().is_hip)
+        validate_mxfp4_args(
+            server_args, is_hip=get_platform().is_hip, native_page64=native_page64
+        )
 
     from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
 
@@ -401,7 +413,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
         from sglang.srt.mem_cache.mxfp4_validation import validate_mxfp4_model
 
         # Backend aliases and page-size defaults are final at this point.
-        validate_mxfp4_args(cfg, is_hip=get_platform().is_hip, final=True)
+        validate_mxfp4_args(
+            cfg, is_hip=get_platform().is_hip, native_page64=native_page64, final=True
+        )
         validate_mxfp4_model(model_config_of(server_args))
 
     server_args._resolution_finished = True
