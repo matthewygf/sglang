@@ -37,7 +37,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 LATENT_BYTES = 400
 INDEX_KEY_BYTES = 128
@@ -324,3 +324,7 @@ def test_mxfp4_hicache_l2_roundtrip(runtime, page_size, io_backend, layout):
         finally:
             torch.cuda.synchronize()
             group.destroy()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

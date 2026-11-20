@@ -29,6 +29,7 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
@@ -41,7 +42,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     torch.version.hip is None
@@ -59,8 +60,6 @@ def restore_runtime():
     finally:
         restore_context(saved)
 
-# Kimi K3.1 Pro native MXFP4 latent row, per REPO_MAP/sglang.md:
-# 400 packed bytes = 6 bit-planes of 64 + 2 scale fields of 8.
 PACKED_ROW_BYTES = 400
 KV_LORA_RANK = 512  # logical latent rank; the packed buffer is 400 bytes wide
 QK_ROPE_HEAD_DIM = 64
@@ -112,7 +111,7 @@ def _tag_rows(pool, slots, seed):
         flat[slots] = packed
     keys = torch.stack(
         [torch.full((INDEX_HEAD_DIM,), float(s + 1)) for s in range(slots.numel())]
-    ).to(torch.float8_e4m3fn).to(device)
+    ).to(fp8_dtype).to(device)
     scales = (slots.float() + 1).unsqueeze(1).to(device)
     pool.set_index_k_scale_buffer(0, slots, keys, scales)
     return keys, scales

@@ -157,9 +157,6 @@ _is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
 if _use_aiter and not _use_aiter_preshuffle:
     if envs.SGLANG_DSA_HIP_DISABLE_PRESHUFFLE.get():
-        # An explicit kill-switch is a decision, not a capability gap. Reporting
-        # it as a Triton/AOT failure would send the reader chasing a toolchain
-        # problem that does not exist.
         logger.info(
             "ROCm DSA indexer: using legacy page_size=1 / KVBlockSize=1 path "
             "because SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 was set."

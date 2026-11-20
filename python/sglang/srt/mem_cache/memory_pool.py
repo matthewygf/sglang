@@ -5154,7 +5154,6 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_rope: torch.Tensor,
     ) -> None:
         if self.dsa_kv_cache_store_mxfp4:
-            self._check_native_mxfp4_layout()
             set_mla_kv_buffer_mxfp4(dst_buffer, loc, cache_k_nope, cache_k_rope)
             return
         assert not (
@@ -5666,20 +5665,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             max_running_requests=max_running_requests,
         )
         self._finalize_allocation_log(size)
-        if self.dsa_kv_cache_store_mxfp4 or self.dsa_kv_cache_store_fp8:
-            latent_bytes = MLATokenToKVPool.get_kv_size_bytes(self)
-            total_bytes = self.get_kv_size_bytes()
-            logger.info(
-                "DSA_POOL_BYTES format=%s rows=%d layers=%d row_bytes=%d "
-                "latent_bytes=%d index_bytes=%d total_bytes=%d",
-                "mxfp4" if self.dsa_kv_cache_store_mxfp4 else "fp8_ds_mla",
-                self.kv_buffer[0].shape[0],
-                len(self.kv_buffer),
-                self.kv_buffer[0].shape[-1] * self.kv_buffer[0].element_size(),
-                latent_bytes,
-                total_bytes - latent_bytes,
-                total_bytes,
-            )
 
     def _create_index_key_cache(self) -> IndexKeyCache:
         if self.index_k_fp4:

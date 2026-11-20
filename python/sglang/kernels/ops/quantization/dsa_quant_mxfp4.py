@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # MXFP4 recipe and E2M1 thresholds adapted from:
 # https://github.com/vllm-project/vllm/blob/0599e4ba72fd29265a0206b29a0d54b308dddcb8/vllm/v1/attention/ops/mxfp4_mla/store.py
-# Port of the Kimi investigation's prototype/codec_smoke.py write_rows.
-# The port retains group32 E2M1/E8M0 and the raw BF16 RoPE tail.
 """Original, bounded native DSA MXFP4 scatter; no alternate codec recipes."""
 
 import torch

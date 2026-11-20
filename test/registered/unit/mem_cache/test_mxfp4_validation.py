@@ -175,6 +175,14 @@ def test_native_hicache_l2_is_admitted(page_size, io_backend, layout, final):
 
 
 @pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize("page_size", [1, 64])
+def test_native_fp4_indexer_is_rejected(page_size, final):
+    cfg = config(page_size=page_size, enable_dsa_fp4_indexer=True)
+    with pytest.raises(ValueError, match="does not support --enable-dsa-fp4-indexer"):
+        validate_mxfp4_args(cfg, is_hip=True, native_page64=page_size == 64, final=final)
+
+
+@pytest.mark.parametrize("final", [False, True])
 def test_native_hicache_l3_is_rejected(final):
     cfg = config(enable_hierarchical_cache=True, hicache_storage_backend="file")
     with pytest.raises(ValueError, match="does not support --hicache-storage-backend"):
@@ -301,8 +309,11 @@ def test_native_qualification_cli():
 
     args = prepare_server_args(
         "--model-path /models/kimi-k31 --kv-cache-dtype mxfp4 --page-size 64 "
-        "--enable-hierarchical-cache --enable-metrics --max-mamba-cache-size 32".split()
+        "--enable-hierarchical-cache --enable-metrics --max-mamba-cache-size 32 "
+        "--speculative-accept-threshold-single=1.0 "
+        "--speculative-accept-threshold-acc=1.0".split()
     )
+    validate_mxfp4_args(args, is_hip=True, native_page64=True)
     assert args.kv_cache_dtype == "mxfp4"
     assert args.page_size == 64 and args.max_mamba_cache_size == 32
     assert args.enable_hierarchical_cache and args.enable_metrics
@@ -310,18 +321,22 @@ def test_native_qualification_cli():
 
 
 @pytest.mark.parametrize(
-    "flag",
+    "option",
     [
-        "--speculative-accept-threshold-single=1.0",  # even an explicit default
+        "--speculative-accept-threshold-single=0.9",
         "--speculative-use-rejection-sampling",
         "--no-speculative-enable-w4a4-mxfp4-megamoe",
+        "--speculative-algorithm DFLASH",
     ],
 )
-def test_speculative_cli_options_rejected(flag):
+def test_non_default_speculative_cli_options_rejected(option):
     from sglang.srt.server_args import prepare_server_args
 
+    args = prepare_server_args(
+        "--model-path /models/kimi-k31 --kv-cache-dtype mxfp4".split() + option.split()
+    )
     with pytest.raises(ValueError, match="MXFP4 KV cache does not support"):
-        prepare_server_args(["--model-path", "dummy", "--kv-cache-dtype", "mxfp4", flag])
+        validate_mxfp4_args(args, is_hip=True)
 
 
 def test_speculative_programmatic_option_rejected():

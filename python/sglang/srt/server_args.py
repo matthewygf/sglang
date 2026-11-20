@@ -789,10 +789,6 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     )
 
     raw_args = parser.parse_args(argv)
-    if raw_args.kv_cache_dtype == "mxfp4":
-        from sglang.srt.mem_cache.mxfp4_validation import reject_mxfp4_speculative_cli
-
-        reject_mxfp4_speculative_cli(argv)
     raw_args._radix_eviction_policy_explicitly_set = (
         radix_eviction_policy_explicitly_set
     )

@@ -14,6 +14,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 SOURCE_ROOT = Path(__file__).resolve().parents[4] / "python/sglang/srt/model_executor"
 

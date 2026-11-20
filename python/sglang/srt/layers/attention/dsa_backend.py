@@ -5109,11 +5109,7 @@ class DeepseekSparseAttnBackend(
             self.use_mha = False  # Decode/verify always use MLA
 
         # Set MLA implementation only if not using MHA
-        if (
-            not self.use_mha
-            and self.enable_auto_select_prefill_impl
-            and not self.dsa_kv_cache_store_mxfp4
-        ):
+        if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.dsa_kv_cache_store_fp8:
                 if (
                     is_blackwell()
@@ -5138,8 +5134,6 @@ class DeepseekSparseAttnBackend(
         SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
-        if self.dsa_kv_cache_store_mxfp4:
-            return TopkTransformMethod.PAGED
         if (
             # disable for MTP
             (

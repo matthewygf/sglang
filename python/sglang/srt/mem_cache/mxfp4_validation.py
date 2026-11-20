@@ -2,13 +2,6 @@
 """Pure launch guards for the native Kimi-K3.1 packed latent KV cache."""
 
 
-def reject_mxfp4_speculative_cli(argv: list[str]) -> None:
-    # An explicit option equal to its default is no longer visible on ServerArgs.
-    for arg in argv:
-        if arg.startswith(("--speculative-", "--no-speculative-")):
-            raise ValueError(f"MXFP4 KV cache does not support {arg.split('=', 1)[0]}.")
-
-
 def validate_mxfp4_args(
     cfg, *, is_hip: bool, final: bool = False, native_page64: bool = False
 ) -> None:
@@ -60,12 +53,13 @@ def validate_mxfp4_args(
         "--speculative-num-steps": cfg.speculative_num_steps is not None,
         "--quantization-param-path": cfg.quantization_param_path is not None,
         "--prefill-only-disable-kv-cache": cfg.prefill_only_disable_kv_cache,
+        "--enable-dsa-fp4-indexer": cfg.enable_dsa_fp4_indexer,
     }
     rejected = [flag for flag, enabled in unsupported.items() if enabled]
     if rejected:
         raise ValueError("MXFP4 KV cache does not support " + ", ".join(rejected) + ".")
     if not final:
-        # Check the raw programmatic input before resolution inherits draft defaults.
+        # Check parsed values before resolution inherits draft defaults.
         from sglang.srt.arg_groups.fields.spec import Spec
 
         defaults = Spec()
@@ -87,11 +81,8 @@ def validate_mxfp4_args(
         raise ValueError(
             "MXFP4 page 64 requires --dsa-paged-mqa-logits-backend auto or aiter."
         )
-    if native_page64 and (cfg.enable_dsa_fp4_indexer or cfg.enable_amd_monokernel):
-        raise ValueError(
-            "MXFP4 page 64 requires the FP8 AITER indexer, not "
-            "--enable-dsa-fp4-indexer or --enable-amd-monokernel."
-        )
+    if native_page64 and cfg.enable_amd_monokernel:
+        raise ValueError("MXFP4 page 64 does not support --enable-amd-monokernel.")
     if final and cfg.enable_hierarchical_cache:
         io_layout = (cfg.hicache_io_backend, cfg.hicache_mem_layout)
         if io_layout != ("direct", "page_first_direct") and not (
