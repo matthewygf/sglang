@@ -4813,7 +4813,6 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self._finalize_allocation_log(size)
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
-        self._reject_native_mxfp4("host/copy pool descriptors")
         from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
@@ -4850,7 +4849,6 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             raise NotImplementedError(f"native MXFP4 does not support {operation}")
 
     def _mla_buffer_info(self):
-        self._reject_native_mxfp4("host/copy pool descriptors")
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 
         start, end = (
@@ -5531,7 +5529,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return not self.skip_topk_layers[local_layer_idx]
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
-        self._reject_native_mxfp4("host/copy pool descriptors")
         from sglang.srt.mem_cache.device_pool_info import (
             DevicePoolInfo,
             IndexKeyBufferInfo,

@@ -20,7 +20,7 @@ def validate_mxfp4_args(
 
     unsupported = {
         "--enable-hisparse": cfg.enable_hisparse,
-        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "--hicache-storage-backend": cfg.hicache_storage_backend is not None,
         "--enable-lmcache": cfg.enable_lmcache,
         "--enable-flexkv": cfg.enable_flexkv,
         "--enable-session-radix-cache": cfg.enable_session_radix_cache,
@@ -73,6 +73,16 @@ def validate_mxfp4_args(
             "MXFP4 page 64 requires the FP8 AITER indexer, not "
             "--enable-dsa-fp4-indexer or --enable-amd-monokernel."
         )
+    if final and cfg.enable_hierarchical_cache:
+        io_layout = (cfg.hicache_io_backend, cfg.hicache_mem_layout)
+        if io_layout != ("direct", "page_first_direct") and not (
+            native_page64 and io_layout == ("kernel", "page_first")
+        ):
+            raise ValueError(
+                "MXFP4 HiCache requires --hicache-io-backend direct with "
+                "--hicache-mem-layout page_first_direct, or kernel with page_first "
+                "at page size 64."
+            )
     for field in (
         "attention_backend",
         "prefill_attention_backend",

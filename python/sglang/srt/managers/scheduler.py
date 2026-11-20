@@ -5932,6 +5932,10 @@ class Scheduler(
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
+        if get_model().kv_cache_dtype == "mxfp4":
+            return AttachHiCacheStorageReqOutput(
+                success=False, message="MXFP4 KV cache does not support HiCache L3."
+            )
 
         if not self.is_fully_idle():
             return AttachHiCacheStorageReqOutput(

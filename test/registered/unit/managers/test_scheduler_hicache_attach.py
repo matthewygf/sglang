@@ -59,6 +59,17 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         )
         self.assertIsNone(self.server_args.hicache_storage_backend)
 
+    def test_mxfp4_rejects_runtime_storage_attach(self):
+        scheduler = self._scheduler(kv_cache_dtype="mxfp4", hicache_storage_backend=None)
+        out = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(hicache_storage_backend="file")
+        )
+
+        self.assertFalse(out.success)
+        self.assertIn("does not support HiCache L3", out.message)
+        self.assertFalse(scheduler.enable_hicache_storage)
+        self.assertIsNone(get_memory().hicache_storage_backend)
+
     def test_detach_clears_the_backend_for_the_same_readers(self):
         scheduler = self._scheduler(hicache_storage_backend="file")
         scheduler.enable_hicache_storage = True
