@@ -481,7 +481,21 @@ def _prune_configs(configs, named_args, **kwargs):
         for c in candidates
         if c.kwargs["BLOCK_N"] <= topk and c.kwargs["BLOCK_N"] <= max_block_n
     ]
-    return keep or [candidates[0]]
+    legal = keep or [candidates[0]]
+    if not kwargs["KV_MXFP4"]:
+        return legal
+    # One surviving config avoids benchmarking during the first native prefill.
+    preferred = (32, 2, 3)
+    return [
+        next(
+            (
+                c
+                for c in legal
+                if (c.kwargs["BLOCK_N"], c.num_warps, c.num_stages) == preferred
+            ),
+            legal[0],
+        )
+    ]
 
 
 _LONG_PREFILL_SEQ_THRESHOLD = 32768
