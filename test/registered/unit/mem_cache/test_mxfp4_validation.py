@@ -195,6 +195,8 @@ def test_native_hicache_rejects_unsupported_resolved_io(page_size, io_backend, l
         ("radix_cache_backend", "custom", "does not support --radix-cache-backend"),
         ("enable_hisparse", True, "does not support --enable-hisparse"),
         ("enable_lmcache", True, "does not support --enable-lmcache"),
+        ("enable_flexkv", True, "does not support --enable-flexkv"),
+        ("enable_kv_cache_sharding", True, "does not support --enable-kv-cache-sharding"),
         ("enable_unified_memory", True, "does not support --enable-unified-memory"),
         ("disaggregation_mode", "prefill", "does not support --disaggregation-mode"),
         ("speculative_algorithm", "EAGLE", "does not support --speculative-algorithm"),
@@ -243,6 +245,39 @@ def test_mxfp4_draft_is_rejected_even_for_other_target():
     )
     with pytest.raises(ValueError, match="does not support speculative draft pools"):
         validate_mxfp4_args(cfg, is_hip=True, final=True)
+
+
+def test_native_qualification_cli():
+    from sglang.srt.mem_cache.platform_kv_cache_dtype import registered_kv_cache_storage_dtype
+    from sglang.srt.server_args import prepare_server_args
+
+    args = prepare_server_args([
+        "--model-path", "/models/kimi-k31", "--kv-cache-dtype", "mxfp4",
+        "--page-size", "64", "--enable-hierarchical-cache", "--enable-metrics",
+        "--max-mamba-cache-size", "32",
+    ])
+    assert (args.kv_cache_dtype, args.page_size, args.max_mamba_cache_size) == ("mxfp4", 64, 32)
+    assert args.enable_hierarchical_cache and args.enable_metrics
+    assert registered_kv_cache_storage_dtype("mxfp4") is None
+
+
+@pytest.mark.parametrize("flag", [
+    "--speculative-accept-threshold-single=1.0",  # even an explicit default
+    "--speculative-use-rejection-sampling",
+    "--no-speculative-enable-w4a4-mxfp4-megamoe",
+])
+def test_speculative_cli_options_rejected(flag):
+    from sglang.srt.server_args import prepare_server_args
+
+    with pytest.raises(ValueError, match="MXFP4 KV cache does not support"):
+        prepare_server_args(["--model-path", "dummy", "--kv-cache-dtype", "mxfp4", flag])
+
+
+def test_speculative_programmatic_option_rejected():
+    cfg = config()
+    cfg.speculative_eagle_topk = 2
+    with pytest.raises(ValueError, match="--speculative-eagle-topk"):
+        validate_mxfp4_args(cfg, is_hip=True)
 
 
 if __name__ == "__main__":

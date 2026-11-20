@@ -2,6 +2,13 @@
 """Pure launch guards for the native Kimi-K3.1 packed latent KV cache."""
 
 
+def reject_mxfp4_speculative_cli(argv: list[str]) -> None:
+    # An explicit option equal to its default is no longer visible on ServerArgs.
+    for arg in argv:
+        if arg.startswith(("--speculative-", "--no-speculative-")):
+            raise ValueError(f"MXFP4 KV cache does not support {arg.split('=', 1)[0]}.")
+
+
 def validate_mxfp4_args(
     cfg, *, is_hip: bool, final: bool = False, native_page64: bool = False
 ) -> None:
@@ -57,6 +64,18 @@ def validate_mxfp4_args(
     rejected = [flag for flag, enabled in unsupported.items() if enabled]
     if rejected:
         raise ValueError("MXFP4 KV cache does not support " + ", ".join(rejected) + ".")
+    if not final:
+        # Check the raw programmatic input before resolution inherits draft defaults.
+        from sglang.srt.arg_groups.fields.spec import Spec
+
+        defaults = Spec()
+        for name in Spec.__struct_fields__:
+            if name.startswith("speculative_"):
+                default = getattr(defaults, name)
+                if getattr(cfg, name, default) != default:
+                    raise ValueError(
+                        f"MXFP4 KV cache does not support --{name.replace('_', '-')}."
+                    )
     if cfg.page_size != (64 if native_page64 else 1) and (
         final or cfg.page_size is not None
     ):
