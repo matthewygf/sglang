@@ -853,6 +853,8 @@ def _kimi_k31_default_dsa_backend(view: Any) -> str:
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
+    if view.kv_cache_dtype == "mxfp4":
+        return {}
     if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
         raise ValueError(
             "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "

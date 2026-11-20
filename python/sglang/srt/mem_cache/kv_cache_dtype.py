@@ -72,6 +72,10 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "mxfp4":
+        if not _is_hip or is_draft_worker or is_dflash:
+            raise ValueError("MXFP4 KV cache requires a non-speculative ROCm target.")
+        kv_cache_dtype = torch.uint8
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):

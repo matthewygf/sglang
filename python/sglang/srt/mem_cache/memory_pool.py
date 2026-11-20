@@ -58,6 +58,7 @@ from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.kernels.ops.quantization.dsa_quant_mxfp4 import set_mla_kv_buffer_mxfp4
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -4876,6 +4877,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
     # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
     kv_scale_ue8m0 = False
     fp8_cast_on_write = False
+    dsa_kv_cache_store_mxfp4 = False
 
     def __init__(
         self,
@@ -4908,6 +4910,13 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
         self.dcp_replicated = dcp_replicated
+        self.dsa_kv_cache_store_mxfp4 = (
+            use_dsa and dtype == torch.uint8 and override_kv_cache_dim == 400
+        )
+        if dtype == torch.uint8 and not self.dsa_kv_cache_store_mxfp4:
+            raise ValueError("native MXFP4 requires DSA, uint8, and a 400-byte row")
+        if self.dsa_kv_cache_store_mxfp4:
+            self._check_native_mxfp4_layout()
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -4917,7 +4926,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_mxfp4
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -4938,6 +4947,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self._finalize_allocation_log(size)
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        self._reject_native_mxfp4("host/copy pool descriptors")
         from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
@@ -4951,7 +4961,25 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             ),
         )
 
+    def _check_native_mxfp4_layout(self):
+        if (
+            not self.use_dsa
+            or self.dtype != torch.uint8
+            or self.kv_lora_rank != 512
+            or self.qk_rope_head_dim != 64
+            or self.page_size != 1
+            or get_parallel().attn_dcp_size != 1
+        ):
+            raise ValueError(
+                "native MXFP4 requires DSA, 512 latent, 64 RoPE, page_size=1, DCP1"
+            )
+
+    def _reject_native_mxfp4(self, operation):
+        if self.dsa_kv_cache_store_mxfp4:
+            raise NotImplementedError(f"native MXFP4 does not support {operation}")
+
     def _mla_buffer_info(self):
+        self._reject_native_mxfp4("host/copy pool descriptors")
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 
         start, end = (
@@ -5011,6 +5039,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        self._reject_native_mxfp4("disaggregation")
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
         kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
         kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
@@ -5029,6 +5058,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
+        self._reject_native_mxfp4("raw value views")
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
@@ -5086,6 +5116,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
+        self._reject_native_mxfp4("combined-row writes")
         assert not self.dsa_kv_cache_store_fp8
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
@@ -5117,6 +5148,10 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
+        if self.dsa_kv_cache_store_mxfp4:
+            self._check_native_mxfp4_layout()
+            set_mla_kv_buffer_mxfp4(dst_buffer, loc, cache_k_nope, cache_k_rope)
+            return
         assert not (
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
@@ -5229,6 +5264,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         dst_dtype: Optional[torch.dtype] = None,
         layer_id_override: Optional[int] = None,
     ):
+        self._reject_native_mxfp4("raw MLA gathers")
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
@@ -5266,6 +5302,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        self._reject_native_mxfp4("CPU offload/retraction")
         indices = maybe_dcp_kernel_indices(
             indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
         )
@@ -5288,6 +5325,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        self._reject_native_mxfp4("CPU offload/retraction")
         indices = maybe_dcp_kernel_indices(
             indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
         )
@@ -5512,6 +5550,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
     ):
+        if dtype == torch.uint8 and (
+            index_kpool != 1 or index_kpool_compress or index_head_dim != 128 or use_fp4_indexer
+        ):
+            raise ValueError(
+                "native MXFP4 requires the unchanged, uncompressed FP8 DSA index cache"
+            )
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
@@ -5613,6 +5657,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
             max_running_requests=max_running_requests,
         )
         self._finalize_allocation_log(size)
+        if self.dsa_kv_cache_store_mxfp4 or self.dsa_kv_cache_store_fp8:
+            latent_bytes = MLATokenToKVPool.get_kv_size_bytes(self)
+            total_bytes = self.get_kv_size_bytes()
+            logger.info(
+                "DSA_POOL_BYTES format=%s rows=%d layers=%d row_bytes=%d "
+                "latent_bytes=%d index_bytes=%d total_bytes=%d",
+                "mxfp4" if self.dsa_kv_cache_store_mxfp4 else "fp8_ds_mla",
+                self.kv_buffer[0].shape[0],
+                len(self.kv_buffer),
+                self.kv_buffer[0].shape[-1] * self.kv_buffer[0].element_size(),
+                latent_bytes,
+                total_bytes - latent_bytes,
+                total_bytes,
+            )
 
     def _create_index_key_cache(self) -> IndexKeyCache:
         if self.index_k_fp4:
@@ -5625,6 +5683,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return not self.skip_topk_layers[local_layer_idx]
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        self._reject_native_mxfp4("host/copy pool descriptors")
         from sglang.srt.mem_cache.device_pool_info import (
             DevicePoolInfo,
             IndexKeyBufferInfo,
@@ -5748,6 +5807,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_compress_tail_buf_infos(self):
+        self._reject_native_mxfp4("disaggregation")
         if not self.kpool_use_compress:
             return [], [], []
         transfer_layer_ids = list(range(self.layer_num))
@@ -5928,6 +5988,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         mamba_indices=None,
         req_pool_index=None,
     ):
+        self._reject_native_mxfp4("CPU offload/retraction")
         super().load_cpu_copy(
             kv_cache_cpu_dict["kv"],
             indices,
@@ -5945,6 +6006,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         torch.cuda.synchronize()
 
     def get_state_buf_infos(self):
+        self._reject_native_mxfp4("disaggregation")
         return self.index_key_cache.state_buf_infos()
 
     def get_kv_size_bytes(self):

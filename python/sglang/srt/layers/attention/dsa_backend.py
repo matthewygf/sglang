@@ -747,6 +747,7 @@ class DeepseekSparseAttnBackend(
 ):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
+    dsa_kv_cache_store_mxfp4 = False
     extend_dummy_seqs_capped_by_req_pool: bool = True
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
@@ -805,6 +806,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_mxfp4 = model_runner.kv_cache_dtype_str == "mxfp4"
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         kimi_k31 = is_kimi_k31(hf_config)
@@ -2935,6 +2937,7 @@ class DeepseekSparseAttnBackend(
                     if self.dsa_index_kpool <= 1
                     else None
                 ),
+                kv_format="mxfp4" if self.dsa_kv_cache_store_mxfp4 else "auto",
             ).squeeze(0)
         elif dsa_impl in (
             "flashmla_sparse",
@@ -4242,6 +4245,7 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
             workspace=workspace,
+            kv_format="mxfp4" if self.dsa_kv_cache_store_mxfp4 else "auto",
         ).squeeze(0)
 
     def _forward_triton_dcp(
@@ -5085,7 +5089,17 @@ class DeepseekSparseAttnBackend(
                 )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
-                and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
+                and (
+                    self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
+                    or self.dsa_kv_cache_store_mxfp4
+                )
+                and (
+                    not self.dsa_kv_cache_store_mxfp4
+                    or (
+                        forward_batch.extend_prefix_lens_cpu is not None
+                        and not any(forward_batch.extend_prefix_lens_cpu)
+                    )
+                )
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
@@ -5095,7 +5109,11 @@ class DeepseekSparseAttnBackend(
             self.use_mha = False  # Decode/verify always use MLA
 
         # Set MLA implementation only if not using MHA
-        if not self.use_mha and self.enable_auto_select_prefill_impl:
+        if (
+            not self.use_mha
+            and self.enable_auto_select_prefill_impl
+            and not self.dsa_kv_cache_store_mxfp4
+        ):
             if self.dsa_kv_cache_store_fp8:
                 if (
                     is_blackwell()
@@ -5120,6 +5138,8 @@ class DeepseekSparseAttnBackend(
         SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
+        if self.dsa_kv_cache_store_mxfp4:
+            return TopkTransformMethod.PAGED
         if (
             # disable for MTP
             (
