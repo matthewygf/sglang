@@ -1,18 +1,4 @@
-"""Ordinary device radix is allowed for native MXFP4; other launch guards remain.
-
-The MXFP4 launch validator used to require ``--disable-radix-cache``. That was a
-policy check, not a kernel invariant: the radix tree stores int64 KV indices and
-never reads the packed 400-byte rows, and the configured Triton sparse-MLA reader
-already accepts the packed format. This file pins the two properties that matter
-after removing it:
-
-1. radix on and radix off are both admitted, in both validator modes;
-2. the guards sampled below still reject, so the change does not silently widen
-the MXFP4 envelope. These are a representative floor, not exhaustive coverage of
-the ``unsupported`` dict.
-
-    python -m pytest test/registered/unit/mem_cache/test_mxfp4_validation.py -v
-"""
+"""Launch policy for native MXFP4 device radix, page size, and HiCache L2."""
 
 from types import SimpleNamespace
 
@@ -38,6 +24,9 @@ def config(**changes):
         disable_radix_cache=False,
         enable_hisparse=False,
         enable_hierarchical_cache=False,
+        hicache_storage_backend=None,
+        hicache_io_backend="direct",
+        hicache_mem_layout="page_first_direct",
         enable_lmcache=False,
         enable_flexkv=False,
         enable_session_radix_cache=False,
@@ -150,18 +139,54 @@ def test_native_page_size_resolution(
             assert resolution_result(args, "page_size") == expected_page
 
 
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize(
+    ("page_size", "io_backend", "layout"),
+    [
+        (1, "direct", "page_first_direct"),
+        (64, "direct", "page_first_direct"),
+        (64, "kernel", "page_first"),
+    ],
+)
+def test_native_hicache_l2_is_admitted(page_size, io_backend, layout, final):
+    cfg = config(
+        page_size=page_size,
+        enable_hierarchical_cache=True,
+        hicache_io_backend=io_backend,
+        hicache_mem_layout=layout,
+    )
+    validate_mxfp4_args(cfg, is_hip=True, native_page64=page_size == 64, final=final)
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_native_hicache_l3_is_rejected(final):
+    cfg = config(enable_hierarchical_cache=True, hicache_storage_backend="file")
+    with pytest.raises(ValueError, match="does not support --hicache-storage-backend"):
+        validate_mxfp4_args(cfg, is_hip=True, final=final)
+
+
+@pytest.mark.parametrize(
+    ("page_size", "io_backend", "layout"),
+    [(1, "kernel", "page_first"), (64, "kernel", "layer_first")],
+)
+def test_native_hicache_rejects_unsupported_resolved_io(page_size, io_backend, layout):
+    cfg = config(
+        page_size=page_size,
+        enable_hierarchical_cache=True,
+        hicache_io_backend=io_backend,
+        hicache_mem_layout=layout,
+    )
+    with pytest.raises(ValueError, match="MXFP4 HiCache requires --hicache-io-backend"):
+        validate_mxfp4_args(cfg, is_hip=True, native_page64=page_size == 64, final=True)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("dcp_size", 2, "requires DCP1"),
         ("attn_cp_size", 2, "requires DCP1"),
         ("enable_prefill_cp", True, "requires DCP1"),
-        ("page_size", 64, "requires --page-size 1"),
-        (
-            "enable_hierarchical_cache",
-            True,
-            "does not support --enable-hierarchical-cache",
-        ),
+        ("page_size", 64, "explicit --page-size 64 with AITER preshuffle"),
         (
             "enable_session_radix_cache",
             True,
@@ -173,6 +198,16 @@ def test_native_page_size_resolution(
         ("enable_unified_memory", True, "does not support --enable-unified-memory"),
         ("disaggregation_mode", "prefill", "does not support --disaggregation-mode"),
         ("speculative_algorithm", "EAGLE", "does not support --speculative-algorithm"),
+        (
+            "quantization_param_path",
+            "scales.json",
+            "does not support --quantization-param-path",
+        ),
+        (
+            "prefill_only_disable_kv_cache",
+            True,
+            "does not support --prefill-only-disable-kv-cache",
+        ),
         (
             "dsa_prefill_backend",
             "triton_sparse_mla",
@@ -186,8 +221,7 @@ def test_native_page_size_resolution(
     ],
 )
 def test_other_guards_still_reject(field, value, message):
-    # Regression floor: the change must not widen the MXFP4 envelope. Each case
-    # enables radix, so the removed error cannot accidentally satisfy it.
+    # Regression floor for guards outside the page-64 and HiCache L2 opt-ins.
     with pytest.raises(ValueError, match=message):
         validate_mxfp4_args(config(**{field: value}), is_hip=True, final=True)
 
