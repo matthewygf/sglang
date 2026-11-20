@@ -10,6 +10,25 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def kimi_model_config():
+    import torch
+
+    hf = SimpleNamespace(
+        architectures=["KimiK31ForConditionalGeneration"],
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=32,
+        index_rope_dim=0,
+    )
+    return SimpleNamespace(
+        hf_config=hf,
+        hf_text_config=hf,
+        dtype=torch.bfloat16,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+
+
 def config(**changes):
     """A valid MXFP4 launch config. Mirrors the qualified Kimi-K3.1 launch."""
     cfg = SimpleNamespace(
@@ -88,13 +107,11 @@ def test_native_page_size_resolution(
 ):
     from sglang.srt.arg_groups import (
         cuda_graph_hook,
-        model_override_base,
         muse_spark_hook,
         pipeline,
     )
     from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
     from sglang.srt.layers.attention.dsa import utils as dsa_utils
-    from sglang.srt.mem_cache import mxfp4_validation
     from sglang.srt.runtime_context import override_platform
     from sglang.srt.server_args import ServerArgs
 
@@ -106,8 +123,6 @@ def test_native_page_size_resolution(
     monkeypatch.setattr(
         cuda_graph_hook, "finalize_cuda_graph_prefill_max_context", lambda _: None
     )
-    monkeypatch.setattr(mxfp4_validation, "validate_mxfp4_model", lambda _: None)
-    monkeypatch.setattr(model_override_base, "model_config_of", lambda _: None)
 
     # Run the real default and final validation without fetching a checkpoint.
     def model_override(hook, args):
@@ -128,6 +143,7 @@ def test_native_page_size_resolution(
         dsa_prefill_backend="triton",
         dsa_decode_backend="triton",
     )
+    args._model_config = kimi_model_config()
     with override_platform(is_hip=True):
         if expected_page is None:
             with pytest.raises(
@@ -254,20 +270,7 @@ def test_in_tree_uint8_row_sizing_requires_the_native_recipe(monkeypatch):
     from sglang.srt.mem_cache import kv_cache_dtype as dtypes
 
     cfg = config()
-    hf = SimpleNamespace(
-        architectures=["KimiK31ForConditionalGeneration"],
-        index_topk=2048,
-        index_head_dim=128,
-        index_n_heads=32,
-        index_rope_dim=0,
-    )
-    model = SimpleNamespace(
-        hf_config=hf,
-        hf_text_config=hf,
-        dtype=torch.bfloat16,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
+    model = kimi_model_config()
     monkeypatch.setattr(dtypes, "_is_hip", True)
     monkeypatch.setattr(pools, "_is_hip", True)
     monkeypatch.setattr(pools, "get_model", lambda: cfg)
