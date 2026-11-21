@@ -36,6 +36,8 @@ def config(**changes):
         speculative_draft_kv_cache_dtype=None,
         model_path="/models/kimi-k31",
         device="cuda",
+        tp_size=8,
+        attn_dp_size=1,
         dcp_size=1,
         attn_cp_size=1,
         enable_prefill_cp=False,
@@ -204,12 +206,26 @@ def test_native_hicache_rejects_unsupported_resolved_io(page_size, io_backend, l
         validate_mxfp4_args(cfg, is_hip=True, native_page64=page_size == 64, final=True)
 
 
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("world", [2, 8])
+def test_native_dcp_is_admitted(world, page_size, final):
+    validate_mxfp4_args(
+        config(dcp_size=world, page_size=page_size),
+        is_hip=True,
+        final=final,
+        native_page64=page_size == 64,
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("dcp_size", 2, "requires DCP1"),
-        ("attn_cp_size", 2, "requires DCP1"),
-        ("enable_prefill_cp", True, "requires DCP1"),
+        ("dcp_size", 0, "power-of-two --dcp-size"),
+        ("dcp_size", 3, "power-of-two --dcp-size"),
+        ("dcp_size", 16, "must divide the attention TP width"),
+        ("attn_cp_size", 2, "--attn-cp-size 1"),
+        ("enable_prefill_cp", True, "no --enable-prefill-cp"),
         ("page_size", 64, "explicit --page-size 64 with AITER preshuffle"),
         (
             "enable_session_radix_cache",

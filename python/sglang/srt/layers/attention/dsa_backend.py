@@ -1869,6 +1869,20 @@ class DeepseekSparseAttnBackend(
                 forward_batch.batch_size,
             )
 
+        dcp_local_kv_rows = None
+        if self.dsa_shards_index_k and page_table_1_flattened is not None:
+            owned = filter_dcp_local_chunk_kv_indices(
+                page_table_1_flattened,
+                torch.zeros_like(indexer_seq_lens_cpu),
+                indexer_seq_lens_cpu,
+            )
+            if self.dsa_kv_cache_store_mxfp4:
+                torch._assert_async(
+                    (owned % self.attn_dcp_size == self.attn_dcp_rank).all(),
+                    "MXFP4 DCP prefill selected a foreign slot",
+                )
+            dcp_local_kv_rows = owned // self.attn_dcp_size
+
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1902,16 +1916,7 @@ class DeepseekSparseAttnBackend(
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
-            dcp_local_kv_rows=(
-                filter_dcp_local_chunk_kv_indices(
-                    page_table_1_flattened,
-                    torch.zeros_like(indexer_seq_lens_cpu),
-                    indexer_seq_lens_cpu,
-                )
-                // self.attn_dcp_size
-                if self.dsa_shards_index_k and page_table_1_flattened is not None
-                else None
-            ),
+            dcp_local_kv_rows=dcp_local_kv_rows,
             indexer_k_start_end=indexer_k_start_end,
             indexer_logical_page_table=indexer_logical_page_table,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
@@ -2607,7 +2612,7 @@ class DeepseekSparseAttnBackend(
         # NOTE(dark): (dsa-) cu_seqlens_q is always arange, no need to copy
 
         assert self.physical_page_size == metadata.page_size
-        if self.physical_page_size > 1:
+        if self.real_page_span > 1:
             if not used_fused_metadata_generation:
                 real_table = self._transform_table_1_to_real(page_indices)
                 new_rows = real_table.shape[0]
@@ -5151,7 +5156,10 @@ class DeepseekSparseAttnBackend(
             and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
-        elif self.dsa_shards_index_k and forward_mode == ForwardMode.EXTEND:
+        elif self.dsa_shards_index_k and forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED

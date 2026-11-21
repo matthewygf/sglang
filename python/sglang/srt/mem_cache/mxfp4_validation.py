@@ -13,10 +13,17 @@ def validate_mxfp4_args(
         raise ValueError("--kv-cache-dtype mxfp4 requires ROCm on --device cuda.")
     if cfg.model_path.lower() in ("none", "dummy"):
         raise ValueError("--kv-cache-dtype mxfp4 requires a Kimi-K3.1 model.")
-    if cfg.dcp_size != 1 or (cfg.attn_cp_size or 1) != 1 or cfg.enable_prefill_cp:
+    if (cfg.attn_cp_size or 1) != 1 or cfg.enable_prefill_cp:
         raise ValueError(
-            "MXFP4 KV cache requires DCP1 and no prefill context parallelism."
+            "MXFP4 KV cache requires --attn-cp-size 1 and no --enable-prefill-cp."
         )
+    # alloc_extend_kernel uses tl.arange(0, page_size * dcp_size).
+    if cfg.dcp_size < 1 or cfg.dcp_size & (cfg.dcp_size - 1):
+        raise ValueError("MXFP4 KV cache requires a positive power-of-two --dcp-size.")
+    if cfg.dcp_size > 1 and (
+        cfg.attn_dp_size < 1 or cfg.tp_size % (cfg.dcp_size * cfg.attn_dp_size)
+    ):
+        raise ValueError("MXFP4 --dcp-size must divide the attention TP width.")
 
     unsupported = {
         "--enable-hisparse": cfg.enable_hisparse,

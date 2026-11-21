@@ -19,10 +19,24 @@ def _check_rows(world):
     # Three nonadjacent allocator pages. The last holds just one live token.
     length = 2 * world + 1
     slots = torch.zeros(length + 1, dtype=torch.int64)
+    prefix = world - 1
     alloc_extend_kernel[(1,)](
-        torch.tensor([0]), torch.tensor([length]), torch.tensor([-1]),
-        torch.tensor([3, 1, 6]), slots, world,
+        torch.tensor([0]),
+        torch.tensor([prefix]),
+        torch.tensor([-1]),
+        torch.tensor([3]),
+        slots[:prefix],
+        world,
     )
+    alloc_extend_kernel[(1,)](
+        torch.tensor([prefix]),
+        torch.tensor([length]),
+        slots[prefix - 1 : prefix],
+        torch.tensor([1, 6]),
+        slots[prefix:],
+        world,
+    )
+    assert torch.equal(slots[:-1] % world, torch.arange(length) % world)
     assert slots[-1] == 0
     gen = torch.Generator().manual_seed(31)
     x = torch.randn((length + 1, 1, 512), generator=gen).bfloat16()

@@ -18,18 +18,19 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 @pytest.mark.parametrize("preshuffle", [False, True])
 @pytest.mark.parametrize(
-    "mode,real_rows,physical_rows",
+    "mode,real_rows,physical_rows,world",
     [
-        (ForwardMode.DECODE, 3, 5),
-        (ForwardMode.DECODE, 3, 3),
-        (ForwardMode.DECODE, 0, 4),
-        (ForwardMode.DECODE, 0, 0),
-        (ForwardMode.TARGET_VERIFY, 6, 8),
-        (ForwardMode.DRAFT_EXTEND_V2, 6, 8),
+        (ForwardMode.DECODE, 3, 5, 1),
+        (ForwardMode.DECODE, 3, 3, 1),
+        (ForwardMode.DECODE, 0, 4, 1),
+        (ForwardMode.DECODE, 0, 0, 1),
+        (ForwardMode.TARGET_VERIFY, 6, 8, 1),
+        (ForwardMode.DRAFT_EXTEND_V2, 6, 8, 1),
+        (ForwardMode.DECODE, 3, 5, 8),
     ],
 )
 def test_aiter_paged_rows_and_restored_padding(
-    preshuffle, mode, real_rows, physical_rows
+    preshuffle, mode, real_rows, physical_rows, world
 ):
     page_size = 64 if preshuffle else 1
     q = torch.arange(physical_rows * 2 * 128, dtype=torch.float32).reshape(
@@ -72,8 +73,14 @@ def test_aiter_paged_rows_and_restored_padding(
         )
         return logits.topk(topk, dim=-1).indices.to(torch.int32)
 
+    # Sharded page-1 index-K still uses the collapsed physical page table.
+    wide = page_table if world == 1 else page_table + 123
     metadata = SimpleNamespace(
-        get_page_table_1=lambda: page_table,
+        get_page_table_1=lambda: wide,
+        attn_metadata=SimpleNamespace(
+            topk_v2_plan=None, dcp_topk_length=torch.empty_like(lengths)
+        ),
+        paged_mqa_ctx_lens_2d=lengths.view(-1, 1),
         get_page_table_64=lambda: page_table,
         get_seqlens_int32=lambda: base_lengths,
         get_seqlens_expanded=lambda: lengths,
@@ -91,6 +98,12 @@ def test_aiter_paged_rows_and_restored_padding(
         mock.patch.object(dsa_indexer, "_is_cuda", False),
         mock.patch.object(dsa_indexer, "_is_xpu", False),
         mock.patch.object(dsa_indexer, "_use_aiter_preshuffle", preshuffle),
+        mock.patch.object(dsa_indexer, "_index_k_dcp", return_value=(world, 0)),
+        mock.patch.object(
+            dsa_indexer,
+            "dcp_local_topk",
+            side_effect=lambda logits, *args: topk_transform(logits, 2),
+        ),
         mock.patch.object(dsa_indexer, "get_token_to_kv_pool", return_value=pool),
         mock.patch.object(
             dsa_indexer, "aiter_paged_mqa_logits", side_effect=kernel

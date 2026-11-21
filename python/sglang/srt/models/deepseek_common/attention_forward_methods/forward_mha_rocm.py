@@ -220,6 +220,9 @@ class DeepseekMHARocmForwardMixin:
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
+            assert self.kv_cache_dtype != "mxfp4", (
+                "native MXFP4 dense MHA requires a prefix-free chunk"
+            )
             if (
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"

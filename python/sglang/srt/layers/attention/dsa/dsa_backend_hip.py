@@ -1,4 +1,4 @@
-"""Kimi-K3.1 ROCm DSA partials over this rank's fp8_ds_mla shard."""
+"""Kimi-K3.1 ROCm DSA partials over this rank's latent KV shard."""
 
 from __future__ import annotations
 
@@ -62,8 +62,11 @@ def forward_triton_dcp_partial(
     # Each rank holds about 1/N of the global top-k; bound rows by their share.
     expected_topk = -(-page_table_1.shape[-1] // backend.attn_dcp_size)
     # gfx950: the MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode
-    if _is_gfx95 and supports_sparse_mla_decode_gfx950(
-        q_nope, kv_cache, layer.v_head_dim
+    mxfp4 = getattr(backend, "dsa_kv_cache_store_mxfp4", False)
+    if (
+        not mxfp4
+        and _is_gfx95
+        and supports_sparse_mla_decode_gfx950(q_nope, kv_cache, layer.v_head_dim)
     ):
         o, lse = sparse_mla_decode_gfx950(
             q_nope=q_nope,
@@ -94,6 +97,7 @@ def forward_triton_dcp_partial(
         lengths=topk_length,
         expected_topk=expected_topk,
         natural_lse=True,
+        kv_format="mxfp4" if mxfp4 else "auto",
     )
     return o.squeeze(0), lse
 
@@ -118,4 +122,4 @@ def dcp_gather_kv_cache(
         row_ids=metadata.dcp_local_kv_rows,
         page_size=backend.physical_page_size,
     )
-    return gathered.view(kv_cache.dtype)
+    return gathered.view(kv_cache.dtype).view(-1, *kv_cache.shape[1:])

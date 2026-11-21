@@ -343,6 +343,7 @@ def _keys_reference(q, keys, idx, sm_scale):
         ("fused", True),
         ("split_k", False),
         ("split_k", True),
+        ("dcp_partial", True),
     ],
 )
 def test_mxfp4_reader_matches_dense_keys(monkeypatch, reader, natural, hardware):
@@ -370,13 +371,30 @@ def test_mxfp4_reader_matches_dense_keys(monkeypatch, reader, natural, hardware)
     idx = torch.full((3, 128), -1, dtype=torch.int32, device=device)
     idx[0, :65] = torch.randperm(96, device=device)[:65]
     idx[2, 0] = 90
-    q = torch.randn(3, 12, 576, device=device, dtype=torch.bfloat16)
+    heads = 96 if reader == "dcp_partial" else 12
+    q = torch.randn(3, heads, 576, device=device, dtype=torch.bfloat16)
     scale = 576**-0.5
     args = (q[..., :512], q[..., 512:], rows, idx.unsqueeze(1), scale)
     if reader == "split_dim":
         out, lse = mla._triton_sparse_mla_fwd_single(
             *args, return_lse=True, kv_format="mxfp4"
         )
+    elif reader == "dcp_partial":
+        backend = SimpleNamespace(
+            dsa_kv_cache_store_mxfp4=True,
+            _triton_sparse_mla_workspaces={},
+            attn_dcp_size=8,
+            forward_metadata=SimpleNamespace(dcp_topk_length=lengths),
+        )
+        partial, lse = dsa_backend_hip.forward_triton_dcp_partial(
+            backend,
+            args[0],
+            args[1],
+            rows,
+            idx,
+            SimpleNamespace(v_head_dim=512, scaling=scale),
+        )
+        out = partial.unsqueeze(0)
     else:
         out, lse = triton_sparse_mla_decode_splitk(
             *args,

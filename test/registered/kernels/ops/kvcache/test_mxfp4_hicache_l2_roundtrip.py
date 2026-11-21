@@ -107,6 +107,21 @@ def test_mxfp4_non_descriptor_guards(runtime, monkeypatch):
             _pool("cpu", page_size=64)
 
 
+@pytest.mark.parametrize("page_size", [1, 64])
+def test_dcp_pool_requires_widened_writes(runtime, monkeypatch, page_size):
+    _rocm_page_geometry_on_cpu(monkeypatch, page_size)
+    monkeypatch.setattr(memory_pool, "_is_gfx95_supported", True)
+    monkeypatch.setattr(memory_pool, "_use_aiter", True)
+    monkeypatch.setattr(memory_pool, "dsa_shards_index_k", lambda: True)
+    with runtime("cpu"), get_parallel().override(attn_dcp_size=8):
+        pool = _pool("cpu", page_size)
+        with pytest.raises(NotImplementedError, match="DCP KV relocation"):
+            pool.move_kv_cache(torch.tensor([8]), torch.tensor([16]))
+        monkeypatch.setattr(DSATokenToKVPool, "write_loc_is_dcp_resolved", True)
+        with pytest.raises(ValueError, match="widened write locations"):
+            _pool("cpu", page_size)
+
+
 @pytest.mark.parametrize("page_size,index_page_bytes", [(1, 132), (64, 8448)])
 def test_hicache_descriptor_geometry(runtime, monkeypatch, page_size, index_page_bytes):
     _rocm_page_geometry_on_cpu(monkeypatch, page_size)

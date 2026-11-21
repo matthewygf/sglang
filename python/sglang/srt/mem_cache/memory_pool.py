@@ -4973,12 +4973,20 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 self.page_size == 64
                 and (self.size % 64 != 0 or not aiter_can_use_preshuffle_paged_mqa())
             )
-            or get_parallel().attn_dcp_size != 1
         ):
             raise ValueError(
-                "native MXFP4 requires DSA, 512 latent, 64 RoPE, DCP1 and either "
+                "native MXFP4 requires DSA, 512 latent, 64 RoPE and either "
                 "page_size=1 or aligned page_size=64 with AITER preshuffle"
             )
+        if get_parallel().attn_dcp_size > 1:
+            if not (_is_gfx95_supported and _use_aiter):
+                raise ValueError(
+                    "native MXFP4 DCP requires gfx95 and SGLANG_USE_AITER=1"
+                )
+            if not dsa_shards_index_k() or self._write_loc_dcp_span == 1:
+                raise ValueError(
+                    "native MXFP4 DCP requires sharded index-K and widened write locations"
+                )
 
     def _reject_native_mxfp4(self, operation):
         if self.dsa_kv_cache_store_mxfp4:
@@ -5154,7 +5162,15 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_rope: torch.Tensor,
     ) -> None:
         if self.dsa_kv_cache_store_mxfp4:
-            set_mla_kv_buffer_mxfp4(dst_buffer, loc, cache_k_nope, cache_k_rope)
+            world = self._write_loc_dcp_span
+            set_mla_kv_buffer_mxfp4(
+                dst_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                dcp_world_size=world,
+                dcp_rank=get_parallel().attn_dcp_rank if world > 1 else 0,
+            )
             return
         assert not (
             self.write_loc_is_dcp_resolved
@@ -5293,6 +5309,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
+        if self.dsa_kv_cache_store_mxfp4 and self._write_loc_dcp_span > 1:
+            self._reject_native_mxfp4("DCP KV relocation")
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")

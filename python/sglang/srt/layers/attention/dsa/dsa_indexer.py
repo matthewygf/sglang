@@ -1497,8 +1497,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             ), f"XPU DSA only supports page_size 64 or 128, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
-        # NOTE(dark): this support extend/decode/decode+graph
-        if _is_hip and not _use_aiter_preshuffle:
+        dcp_size, _ = _index_k_dcp()
+        # Even at physical page size 1, a sharded index page spans N global IDs.
+        if _is_hip and not _use_aiter_preshuffle and dcp_size == 1:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
@@ -1524,7 +1525,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
-        dcp_size, _ = _index_k_dcp()
         assert (
             dcp_size == 1
             or forward_batch.forward_mode.is_decode_or_idle()
@@ -1840,7 +1840,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         weights = weights.squeeze(-1)
 
-        if _is_hip and not _use_aiter_preshuffle:
+        if _is_hip and not _use_aiter_preshuffle and not dsa_shards_index_k():
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_logical_page_table()
@@ -2165,9 +2165,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             int(local_lens_cpu.sum()),
             max(int(local_lens_cpu.max()), 1),
         )
-        rows = k_fp8.shape[0]
-        k_bytes = k_fp8.view(torch.uint8).view(rows, -1)
-        s_bytes = k_scale.view(torch.uint8).view(rows, -1)
+        k_bytes = k_fp8.view(torch.uint8).flatten(1)
+        s_bytes = k_scale.view(torch.uint8).flatten(1)
         gathered = dcp_gather_request_rows(
             torch.cat([k_bytes, s_bytes], dim=-1), seq_lens_cpu
         )
@@ -2429,7 +2428,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             page_size = pool.index_page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
+            out_loc = out_cache_loc
             if dcp_size > 1:
                 out_loc = dsa_indexer_hip.dcp_local_store_loc(
                     forward_batch, layer_id, out_loc, dcp_size, dcp_rank
