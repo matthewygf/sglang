@@ -22,13 +22,17 @@ def _write_mxfp4_rows(
     SS: tl.constexpr,
     CS: tl.constexpr,
     CAP: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    slot = tl.load(Slots + row * SS).to(tl.int64)
-    in_bounds = (slot >= 0) & (slot < CAP)
+    loc = tl.load(Slots + row * SS).to(tl.int64)
+    in_bounds = (loc >= 0) & (loc < CAP * DCP_WORLD_SIZE)
     tl.device_assert(in_bounds, "native MXFP4 write location is out of bounds")
-    # Slot zero is reserved for padded tokens, which may repeat and contain NaNs.
-    valid = (slot > 0) & in_bounds
+    # Local row zero is reserved for padding, including DCP graph capture.
+    slot = loc // DCP_WORLD_SIZE
+    valid = in_bounds & (slot > 0) & (loc % DCP_WORLD_SIZE == DCP_RANK)
+    slot = tl.where(valid, slot, 0)
     cols = tl.arange(0, 512)
     x = tl.load(X + row * XS + cols * XC, valid, 0).to(tl.float32)
     grouped = tl.reshape(x, (16, 32))
@@ -81,14 +85,19 @@ def set_mla_kv_buffer_mxfp4(
     loc: torch.Tensor,
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
+    *,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     """Scatter BF16 [N,1,512]/[N,1,64] rows into contiguous uint8 [CAP,1,400].
 
-    Real physical locations must be unique within a scheduler write; only the
-    reserved padding location zero may repeat. Device checks do not host-sync
-    or inspect padded inputs, and reject nonfinite/overflowing real rows;
+    Real locations must be unique per (owner rank, local row) within a write.
+    Device checks do not host-sync or inspect padding or foreign inputs,
+    and reject nonfinite/overflowing real rows;
     underflowing 32-value groups are stored as zero.
     """
+    if not 0 <= dcp_rank < dcp_world_size:
+        raise ValueError("native MXFP4 requires 0 <= dcp_rank < dcp_world_size")
     if cache.dtype != torch.uint8 or cache.ndim != 3 or cache.shape[1:] != (1, 400):
         raise ValueError("native MXFP4 cache requires uint8 [capacity,1,400]")
     if not cache.is_contiguous():
@@ -122,6 +131,8 @@ def set_mla_kv_buffer_mxfp4(
         loc.stride(0),
         cache.stride(0),
         cache.shape[0],
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
         num_warps=4,
         debug=True,
     )
