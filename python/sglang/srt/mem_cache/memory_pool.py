@@ -4992,6 +4992,18 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         if self.dsa_kv_cache_store_mxfp4:
             raise NotImplementedError(f"native MXFP4 does not support {operation}")
 
+    def get_kv_buffer_shape(self):
+        # DCP>1 needs the KV buffer shape to build context-parallel metadata, but
+        # only as a shape. The default implementation calls get_value_buffer, which
+        # native MXFP4 rejects because a uint8 400-byte row has no meaningful value
+        # view. Derive the shape from the backing buffer instead so the query does
+        # not materialise a view it would throw away.
+        if self.dsa_kv_cache_store_mxfp4:
+            row = self.kv_buffer[self.start_layer]
+            cols = self.kv_cache_dim
+            return row.shape[:-1] + (cols,), row.shape[:-1] + (cols,)
+        return super().get_kv_buffer_shape()
+
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 
