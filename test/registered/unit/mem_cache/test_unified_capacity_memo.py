@@ -36,7 +36,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import demand_windows
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _build(lazy: bool):
