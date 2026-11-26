@@ -395,6 +395,7 @@ from sglang.srt.rust_server.server import (
     drain_notify_name,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -1784,17 +1785,22 @@ class Scheduler(
             )
 
     def _gpu_work_on_forward_stream(self) -> bool:
-        # Muse Spark's monokernel launches need every one of their workgroups resident
-        # at once (they wait on each other); a kernel on another stream that takes a CU
-        # while one is dispatched can leave it waiting forever. Keep the scheduler's GPU
-        # work and the result readback on the forward stream (the host side still
-        # overlaps; its kernels queue behind the forward's).
+        # These monokernels need every workgroup resident at once. A kernel on
+        # another stream can starve a workgroup and deadlock the monokernel.
+        # Share the forward stream for GPU work, but keep host scheduling overlap.
         architectures = self.model_config.hf_config.architectures
         return bool(
             _is_hip
             and get_exec().kernel.enable_amd_monokernel
             and architectures
-            and is_muse_spark_architecture(architectures[0])
+            and (
+                is_muse_spark_architecture(architectures[0])
+                or (
+                    architectures[0] == "KimiK31ForConditionalGeneration"
+                    and self.spec_algorithm.is_dflash()
+                    and get_model().kv_cache_dtype == "mxfp4"
+                )
+            )
         )
 
     def init_overlap(self):
@@ -3545,6 +3551,45 @@ class Scheduler(
                 finished_reason=finished_reason,
             )
             return
+
+        # Launch validation allows MXFP4 + DFLASH only for the experimental
+        # TP8/DCP8 page-64 path. Use the normalized params, before grammar or KV admission.
+        if self.spec_algorithm.is_dflash() and get_model().kv_cache_dtype == "mxfp4":
+            params = req.sampling_params
+            block_verify = get_spec().speculative_use_block_verification
+            sampled_block = (
+                block_verify
+                and params.top_k == TOP_K_ALL
+                and params.sampling_seed is None
+                and not req.return_logprob
+                and not req.return_sampling_mask
+            )
+            if not (
+                (params.top_k == 1 or sampled_block)
+                and params.top_p == 1.0
+                and params.min_p == 0.0
+                and params.frequency_penalty == params.presence_penalty == 0.0
+                and params.repetition_penalty == 1.0
+                and params.min_new_tokens == 0
+                and params.json_schema is None
+                and params.regex is None
+                and params.ebnf is None
+                and params.structural_tag is None
+                and params.logit_bias is None
+                and params.watermark is None
+                and req.custom_logit_processor is None
+            ):
+                self._reject_bad_request(
+                    req,
+                    "Experimental MXFP4 DFLASH supports only unmodified greedy decoding"
+                    + (
+                        " or unfiltered sampling without a request seed, "
+                        "logprobs or a sampling mask."
+                        if block_verify
+                        else "."
+                    ),
+                )
+                return
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)

@@ -76,6 +76,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_serving,
@@ -599,6 +600,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     _megakernel_embed = None
     _verify_planner: Optional[DSparkVerifyPlanner] = None
     _aux_pending: bool = False
+    _sampled_block_tp_group = None
 
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -732,6 +734,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 embed_proj=embed_proj,
             )
         self._block_verification = get_spec().speculative_use_block_verification
+        if self._block_verification and get_model().kv_cache_dtype == "mxfp4":
+            # MXFP4's launch guard already restricts DFLASH to static TP8/DCP8.
+            # Never silently run a point-mass or greedy fallback in this experiment.
+            if (
+                self._is_domino
+                or self.selector is None
+                or not self._selector_sampling_enabled
+            ):
+                raise ValueError(
+                    "Experimental MXFP4 DFLASH block verification needs a sampled DFlash2 selector."
+                )
+            self._sampled_block_tp_group = get_dp_tp_group()
         if (
             self._block_verification
             and (
@@ -2180,6 +2194,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         return tokens.view(bs, num_pred)
 
+    def _sync_sampled_block_proposal(self, tokens, sampling_info):
+        group = self._sampled_block_tp_group
+        if group is None or _is_all_greedy(sampling_info):
+            return tokens
+        if self._selector_sample is None:
+            raise RuntimeError(
+                "MXFP4 DFLASH sampled block is missing selector probabilities."
+            )
+        # Outside graph capture: both the replay and eager paths have produced a
+        # complete draw. Sync its realized conditional q along with the tokens;
+        # broadcasting coins alone would still rely on identical rank-local logits.
+        candidate_ids, q_rows = self._selector_sample
+        tokens, candidate_ids, q_rows = (
+            group.broadcast(t.contiguous(), src=0) for t in (tokens, candidate_ids, q_rows)
+        )
+        self._selector_sample = (candidate_ids, q_rows)
+        return tokens
+
     def _selector_sampling_accept(
         self,
         *,
@@ -3563,7 +3595,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 cutoff_verify_lens=cutoff_verify_lens,
             )
             bcast = self._megakernel_bcast
-            if (
+            if self._sampled_block_tp_group is not None:
+                # The sampled accept is outside the target graph, too. Every rank
+                # commits rank 0's decision before ReplaySSM and draft KV updates.
+                for values in (accept_len, bonus, cap_trim_lens):
+                    self._sampled_block_tp_group.broadcast(values, src=0)
+            elif (
                 bcast is None
                 or cutoff_verify_lens is not None
                 or not bcast.rank0_broadcast(accept_len, bonus)
@@ -3754,7 +3791,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
+            if self._sampled_block_tp_group is not None and not _is_all_greedy(
+                batch.sampling_info
+            ):
+                # The target prefill samples the first anchor, before draft verify.
+                self._sampled_block_tp_group.broadcast(next_token_ids, src=0)
+            else:
+                self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
             new_seq_lens = batch.seq_lens
             batch_output.new_seq_lens = new_seq_lens
             if on_publish is not None:
@@ -4250,6 +4293,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
+        draft_next = self._sync_sampled_block_proposal(draft_next, batch.sampling_info)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         if not (
             bs == 1

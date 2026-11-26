@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -63,6 +64,25 @@ def forward_triton_dcp_partial(
     expected_topk = -(-page_table_1.shape[-1] // backend.attn_dcp_size)
     # gfx950: the MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode
     mxfp4 = getattr(backend, "dsa_kv_cache_store_mxfp4", False)
+    if mxfp4 and _is_gfx95 and os.environ.get("SGLANG_MXFP4_NATIVE_DECODE_GFX950") == "1":
+        from sglang.kernels.ops.attention.dsa.sparse_mla_decode_mxfp4_gfx950 import (
+            sparse_mla_decode_mxfp4_gfx950,
+            supports_sparse_mla_decode_mxfp4_gfx950,
+        )
+
+        if supports_sparse_mla_decode_mxfp4_gfx950(q_nope, kv_cache, layer.v_head_dim):
+            o, lse = sparse_mla_decode_mxfp4_gfx950(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=layer.scaling,
+                topk_length=topk_length,
+                expected_topk=expected_topk,
+            )
+            return o.squeeze(0), lse
+    # Unsharded decode/extend stay on Triton: they don't provide the DCP
+    # valid-prefix counts. H % 16 alone does not establish the indices contract.
     if (
         not mxfp4
         and _is_gfx95

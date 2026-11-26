@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+
 
 def get_mamba_tracking_slots(
     *, extra_buffer: bool, overlap: bool, lazy: bool = False
@@ -28,6 +30,20 @@ def get_mamba_tracking_slots(
     if lazy:
         return 1
     return 2 if overlap else 1
+
+
+def get_device_mamba_radix_slots_per_request(
+    *, extra_buffer: bool, overlap: bool, lazy: bool = False
+) -> int:
+    """State slots per request when radix checkpoints stay on device."""
+    base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+    if not extra_buffer:
+        # The prefill-to-decode peak still needs three slots without tracking.
+        return base
+    # Skipping the decode lock frees one resident slot per running request.
+    if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get():
+        base -= 1
+    return base + get_mamba_tracking_slots(extra_buffer=True, overlap=overlap, lazy=lazy)
 
 
 def get_alloc_page_size() -> int:

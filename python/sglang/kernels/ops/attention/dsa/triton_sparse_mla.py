@@ -11,6 +11,7 @@ for native CDNA MFMA tile alignment.
 
 import contextlib
 import functools
+import os
 
 import torch
 import triton
@@ -1617,6 +1618,21 @@ def triton_sparse_mla_fwd(
             "gfx950 sparse MLA prefill takes only 656-byte fp8_ds_mla rows, at most 16 "
             "heads and a KV pool within 31-bit offsets; long prefill stays on Triton"
         )
+    if (
+        kv_mxfp4
+        and base_ctas > num_cu
+        and os.environ.get("SGLANG_MXFP4_NATIVE_PREFILL_GFX950") == "1"
+        and is_gfx95_supported()
+    ):
+        from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_mxfp4_gfx950 import (
+            sparse_mla_prefill_mxfp4_gfx950,
+            supports_sparse_mla_prefill_mxfp4_gfx950,
+        )
+
+        if supports_sparse_mla_prefill_mxfp4_gfx950(q_nope, q_rope, kv, d_v):
+            return sparse_mla_prefill_mxfp4_gfx950(
+                q_nope, q_rope, kv, indices, sm_scale, d_v=d_v, return_lse=return_lse
+            )
     if base_ctas > num_cu:
         # The single-pass kernel needs H <= 16 or a power of two (DCP decode
         # gathers q from the group, e.g. 96 heads); the fused kernel masks heads.

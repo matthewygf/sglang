@@ -1,6 +1,6 @@
 """gfx950 BF16 GEMM routing under AITER for UnquantizedLinearMethod and the GEMMs that
 bypass it (Kimi-K3's, the DCP q-replicate q_b): the shapes hipBLASLt takes from AITER's
-tuned table, and AITER's tuned FlyDSL kernel straight into caller storage."""
+tuned table, and AITER's tuned kernels straight into caller storage."""
 
 import functools
 from typing import Optional
@@ -31,6 +31,16 @@ def a16w16_is_tuned(m: int, n: int, k: int, has_bias: bool) -> bool:
         )
         is not None
     )
+
+
+@functools.lru_cache(maxsize=4096)
+def _a16w16_tuned_libtype(m: int, n: int, k: int) -> Optional[str]:
+    from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config
+
+    config = get_GEMM_A16W16_tuned_config(
+        m, n, k, False, str(torch.bfloat16), str(torch.bfloat16)
+    )
+    return None if config is None else config["libtype"]
 
 
 @functools.lru_cache(maxsize=4096)
@@ -78,13 +88,12 @@ def prefer_hipblaslt(m: int, n: int, k: int) -> bool:
 
 
 def a16w16_into(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> bool:
-    """Run AITER's tuned FlyDSL bf16 GEMM for this shape straight into ``out``.
+    """Run AITER's tuned bf16 GEMM for this shape straight into ``out``.
 
-    tgemm.mm cannot write caller storage or an fp32 output, and copies a
-    row-strided input, so such GEMMs otherwise fall back to hipBLASLt. ``x``
-    may be a row slice of a wider buffer; ``out`` is contiguous bf16 or fp32
-    (the tile tuned for bf16 output). Returns False when the tuned kernel is
-    not FlyDSL or the operands do not fit it.
+    For bf16 output, a tuned non-FlyDSL row can use ``tgemm.mm(out=...)``.
+    Otherwise use the existing FlyDSL tile (also for fp32 output), or return
+    False so the caller can fall back to torch. ``x`` may be a row slice of
+    a wider buffer.
     """
     if not (
         _use_aiter
@@ -102,7 +111,28 @@ def a16w16_into(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> boo
         and not prefer_hipblaslt(x.shape[0], weight.shape[0], weight.shape[1])
     ):
         return False
-    launch = _a16w16_flydsl_launch(x.shape[0], weight.shape[0], weight.shape[1])
+    m, n, k = x.shape[0], weight.shape[0], weight.shape[1]
+    if (
+        out.dtype == torch.bfloat16
+        and weight.ndim == 2
+        and x.device == weight.device == out.device
+        and n > 0
+        and k > 0
+        and x.stride(0) >= k
+        and weight.stride(0) >= k
+        and out.stride() == (n, 1)
+        and _dma_aligned(out)
+        and getattr(weight, "is_shuffled", False) is not True
+        # These backends honor padded input rows. Skinny GEMMs may assume
+        # packed inputs, so leave those on the existing path.
+        and _a16w16_tuned_libtype(m, n, k)
+        in ("asm", "hipblaslt", "opus", "torch", "triton")
+    ):
+        from aiter.tuned_gemm import tgemm
+
+        tgemm.mm(x, weight, otype=out.dtype, out=out)
+        return True
+    launch = _a16w16_flydsl_launch(m, n, k)
     if launch is None:
         return False
     from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16
@@ -120,7 +150,7 @@ def a16w16_into(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> boo
 
 
 def a16w16_tuned(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
-    """``x @ weight.T`` through AITER's tuned FlyDSL kernel, else None."""
+    """``x @ weight.T`` through AITER's tuned kernel, else None."""
     if not (_use_aiter and _is_gfx95):
         return None
     out = x.new_empty((x.shape[0], weight.shape[0]))

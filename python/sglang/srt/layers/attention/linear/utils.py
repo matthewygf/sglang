@@ -82,6 +82,14 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     verify: LinearAttnKernelBackend
 
 
+def resolve_linear_attn_verify_backend(
+    decode: str, verify: Optional[str]
+) -> LinearAttnKernelBackend:
+    if verify is None:
+        verify = decode if decode in ("flashinfer", "intel_xpu") else "triton"
+    return LinearAttnKernelBackend(verify)
+
+
 def resolve_linear_attn_backends(
     prefill_default: Optional[str] = None,
 ) -> LinearAttnBackends:
@@ -97,17 +105,12 @@ def resolve_linear_attn_backends(
         mamba.linear_attn_prefill_backend or prefill_default or base
     )
 
-    # Unset verify follows decode for backends with their own verify kernel.
-    verify = mamba.linear_attn_verify_backend
-    if verify is None:
-        verify = (
-            decode.value
-            if decode.is_flashinfer() or decode.is_intel_xpu()
-            else "triton"
-        )
-
     backends = LinearAttnBackends(
-        decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)
+        decode=decode,
+        prefill=prefill,
+        verify=resolve_linear_attn_verify_backend(
+            decode.value, mamba.linear_attn_verify_backend
+        ),
     )
     rank0_log(
         f"Linear attention kernel backend: decode={backends.decode.value}, "

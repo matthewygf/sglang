@@ -42,11 +42,20 @@ def configure_kv_cache_dtype(
     model_dtype: torch.dtype,
     is_draft_worker: bool,
     is_dflash: bool,
-    speculative_draft_attention_backend: str,
+    speculative_draft_attention_backend: Optional[str],
     speculative_draft_kv_cache_dtype: Optional[str] = None,
 ) -> tuple[str, torch.dtype]:
     """(label, torch dtype) of a runner's KV cache; a pool in the compute
     dtype is labelled "auto", which backends gate FP8 casts and descales on."""
+    if server_args_kv_cache_dtype == "mxfp4" and is_dflash and (
+        not _is_hip
+        or speculative_draft_kv_cache_dtype != "fp8_e4m3"
+        or (
+            speculative_draft_attention_backend != "triton"
+            and (is_draft_worker or speculative_draft_attention_backend is not None)
+        )
+    ):
+        raise ValueError("MXFP4 DFLASH requires ROCm and an FP8 E4M3 Triton draft.")
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
     kv_cache_dtype_str = server_args_kv_cache_dtype
@@ -73,8 +82,8 @@ def configure_kv_cache_dtype(
         else:
             kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype == "mxfp4":
-        if not _is_hip or is_draft_worker or is_dflash:
-            raise ValueError("MXFP4 KV cache requires a non-speculative ROCm target.")
+        if not _is_hip or is_draft_worker:
+            raise ValueError("MXFP4 KV cache requires a ROCm target worker.")
         kv_cache_dtype = torch.uint8
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn

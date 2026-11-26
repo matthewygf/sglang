@@ -47,6 +47,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     resolve_kv_cache_quant,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
+    get_device_mamba_radix_slots_per_request,
     get_mamba_tracking_slots,
     get_req_to_token_extra_context_len,
 )
@@ -244,16 +245,6 @@ def mm_runtime_reservation_gb(
             reserved_mb / 1024,
         )
     return reserved_mb / 1024
-
-
-# base ratio of mamba pool size to max_running_requests. Under
-# SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
-# per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
-# stays at effective 3 either way: its binding limit is the prefill->decode peak,
-# which the decode-time drop does not shrink.
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
-MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 
 def _pp_local_per_request_bytes(
@@ -3386,29 +3377,16 @@ class KVCacheConfigurator:
                 lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             )
 
-        skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
-        base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
-            MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
-        )
-
-        additional_ratio = 0
-        if get_exec().mamba.enable_mamba_extra_buffer:
-            if get_schedule().disable_overlap_schedule:
-                assert not get_exec().mamba.enable_mamba_extra_buffer_lazy, (
-                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
-                )
-            additional_ratio = get_mamba_tracking_slots(
-                extra_buffer=True,
-                overlap=not get_schedule().disable_overlap_schedule,
-                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+        extra_buffer = get_exec().mamba.enable_mamba_extra_buffer
+        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
+        overlap = not get_schedule().disable_overlap_schedule
+        if extra_buffer and not overlap:
+            assert not lazy, (
+                "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
             )
-        elif skip_decode_lock:
-            # no_buffer under skip: add the base drop back so effective stays 3,
-            # the prefill->decode peak needs ~3 slots/req and this leaf-only mode
-            # has no ping-pong to absorb it.
-            additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER
-
-        return base + additional_ratio
+        return get_device_mamba_radix_slots_per_request(
+            extra_buffer=extra_buffer, overlap=overlap, lazy=lazy
+        )
 
     def _apply_token_constraints(self, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
