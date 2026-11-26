@@ -1604,6 +1604,31 @@ def triton_sparse_mla_fwd(
                 d_v=d_v,
                 return_lse=return_lse,
             )
+    if (
+        kv_mxfp4
+        and _HIP_SPLIT_MIN_ROWS <= seq <= _HIP_SPLIT_MAX_ROWS
+        and os.environ.get("SGLANG_MXFP4_NATIVE_PREFILL_GFX950") == "1"
+        and is_gfx95_supported()
+    ):
+        from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_gfx950 import (
+            sparse_mla_decode_splits,
+        )
+        from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_mxfp4_gfx950 import (
+            sparse_mla_split_mxfp4_gfx950,
+            supports_sparse_mla_prefill_mxfp4_gfx950,
+        )
+
+        if supports_sparse_mla_prefill_mxfp4_gfx950(q_nope, q_rope, kv, d_v):
+            return sparse_mla_split_mxfp4_gfx950(
+                q_nope,
+                q_rope,
+                kv,
+                indices,
+                sm_scale,
+                sparse_mla_decode_splits(seq),
+                d_v=d_v,
+                return_lse=return_lse,
+            )
     if not kv_mxfp4 and base_ctas > num_cu and is_gfx95_supported():
         from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_gfx950 import (
             sparse_mla_prefill_gfx950,

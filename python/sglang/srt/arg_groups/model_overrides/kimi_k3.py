@@ -242,6 +242,17 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
+    elif (
+        cfg.dcp_size == 1
+        and cfg.tp_size == 8
+        and get_platform().is_gfx95
+        and cfg.kv_cache_dtype == "mxfp4"
+        and cfg.page_size == 64
+        and cfg.speculative_algorithm == "DFLASH"
+    ):
+        # Match the native MXFP4 DFLASH verify-mode guard without exposing an
+        # extra speculative CLI override. DSA still handles verify in extend.
+        overrides["speculative_attention_mode"] = "decode"
     if cfg.enable_flashmla_prefill_token_packing is None:
         logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
         overrides["enable_flashmla_prefill_token_packing"] = True

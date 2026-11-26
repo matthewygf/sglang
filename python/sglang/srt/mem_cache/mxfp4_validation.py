@@ -154,7 +154,7 @@ def _validate_mxfp4_dflash(cfg, *, final: bool, native_page64: bool) -> None:
     if not (
         native_page64
         and get_platform().is_gfx95
-        and (cfg.tp_size, cfg.dcp_size) == (8, 8)
+        and (cfg.tp_size, cfg.dcp_size) in {(8, 8), (8, 1)}
         and cfg.attn_dp_size == cfg.dp_size == cfg.pp_size == cfg.nnodes == 1
         and cfg.speculative_draft_model_path
         and cfg.speculative_draft_kv_cache_dtype == "fp8_e4m3"
@@ -163,7 +163,7 @@ def _validate_mxfp4_dflash(cfg, *, final: bool, native_page64: bool) -> None:
     ):
         raise ValueError(
             "MXFP4 KV cache does not support DFLASH outside the experimental "
-            "gfx95 TP8/DCP8 single-node configuration with explicit page 64, "
+            "gfx95 TP8/DCP8 or TP8/DCP1 single-node configuration with explicit page 64, "
             "a draft model, fp8_e4m3 draft KV, block size 6 and Triton draft attention."
         )
     verify_backend = cfg.linear_attn_verify_backend
