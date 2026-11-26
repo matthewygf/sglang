@@ -187,14 +187,21 @@ def _validate_mxfp4_dflash(cfg, *, final: bool, native_page64: bool) -> None:
     radix_overlap = (
         not cfg.disable_radix_cache
         and not cfg.disable_overlap_schedule
-        and cfg.dcp_comm_backend == "a2a"
         and cfg.enable_amd_monokernel
         and not cfg.enable_mixed_chunk
         and not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+        # DCP1 has no DCP reduction and can use the regular draft KV pool.
+        # Draft backend compatibility with the ring is checked separately.
         and (
-            cfg.speculative_dflash_draft_kv_ring
-            if final
-            else envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get()
+            cfg.dcp_size == 1
+            or (
+                cfg.dcp_comm_backend == "a2a"
+                and (
+                    cfg.speculative_dflash_draft_kv_ring
+                    if final
+                    else envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get()
+                )
+            )
         )
     )
     if cfg.enable_hierarchical_cache or not (
@@ -202,8 +209,9 @@ def _validate_mxfp4_dflash(cfg, *, final: bool, native_page64: bool) -> None:
     ):
         raise ValueError(
             "MXFP4 DFLASH requires no radix cache, HiCache or overlap schedule, "
-            "except for device radix and overlap together with a2a, AMD monokernel, "
-            "the DFLASH draft KV ring, no mixed chunks, and no separate overlap plan stream."
+            "except for device radix and overlap together with AMD monokernel, "
+            "no mixed chunks, and no separate overlap plan stream. "
+            "DCP8 also requires a2a and the DFLASH draft KV ring."
         )
     if radix_overlap and final and (
         cfg.mamba_radix_cache_strategy != "extra_buffer"

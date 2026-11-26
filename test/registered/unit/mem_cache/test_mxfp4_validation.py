@@ -176,6 +176,76 @@ def test_native_hicache_l2_is_admitted(page_size, io_backend, layout, final):
     validate_mxfp4_args(cfg, is_hip=True, native_page64=page_size == 64, final=final)
 
 
+@pytest.mark.parametrize("final", [False, True], ids=["raw", "resolved"])
+@pytest.mark.parametrize(
+    ("dcp_size", "comm_backend", "ring", "incompatible_flag"),
+    [
+        pytest.param(1, None, False, None, id="dcp1-default"),
+        pytest.param(1, "ag_rs", True, None, id="dcp1-ring-independent"),
+        pytest.param(1, "ag_rs", False, "enable_mixed_chunk", id="dcp1-mixed-chunk"),
+        pytest.param(1, "ag_rs", False, "enable_hierarchical_cache", id="dcp1-hicache"),
+        pytest.param(8, "a2a", True, None, id="dcp8-a2a-ring"),
+        pytest.param(8, "ag_rs", True, None, id="dcp8-no-a2a"),
+        pytest.param(8, "a2a", False, None, id="dcp8-no-ring"),
+    ],
+)
+def test_native_page64_dflash_radix_overlap(
+    monkeypatch, final, dcp_size, comm_backend, ring, incompatible_flag
+):
+    from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+    from sglang.srt.runtime_context import override_platform
+    from sglang.srt.server_args import ServerArgs
+
+    monkeypatch.setenv("SGLANG_RAGGED_VERIFY_MODE", "static")
+    monkeypatch.setenv("SGLANG_SIMULATE_ACC_LEN", "-1")
+    monkeypatch.setenv("SGLANG_ENABLE_OVERLAP_PLAN_STREAM", "0")
+    monkeypatch.setenv("SGLANG_ENABLE_DFLASH_DRAFT_KV_RING", str(int(ring)))
+    cfg = ServerArgs(
+        model_path="/models/kimi-k31",
+        device="cuda",
+        kv_cache_dtype="mxfp4",
+        tp_size=8,
+        dcp_size=dcp_size,
+        dcp_comm_backend=comm_backend,
+        page_size=64,
+        attention_backend="dsa",
+        dsa_prefill_backend="triton",
+        dsa_decode_backend="triton",
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path="/models/draft",
+        speculative_draft_kv_cache_dtype="fp8_e4m3",
+        speculative_dflash_block_size=6,
+        speculative_draft_attention_backend="triton",
+        disable_radix_cache=False,
+        disable_overlap_schedule=False,
+        enable_linear_replayssm_spec=True,
+        linear_attn_verify_backend="triton",
+        enable_amd_monokernel=True,
+        mamba_radix_cache_strategy="extra_buffer",
+        mamba_ssm_dtype="float32",
+        enable_int8_mamba_checkpoint=False,
+    )
+    if incompatible_flag:
+        setattr(cfg, incompatible_flag, True)
+    if final:
+        cfg.speculative_dflash_draft_kv_ring = ring
+        cfg.speculative_num_draft_tokens = 6
+        cfg.speculative_num_steps = cfg.speculative_eagle_topk = 1
+        cfg.speculative_attention_mode = "decode"
+        cfg.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(), prefill=PhaseConfig()
+        )
+
+    # Test only the MXFP4 policy; the draft backend still validates ring support.
+    with override_platform(is_hip=True, is_cuda=False, is_gfx95=True):
+        kwargs = dict(is_hip=True, native_page64=True, final=final)
+        if incompatible_flag or (dcp_size == 8 and (comm_backend != "a2a" or not ring)):
+            with pytest.raises(ValueError, match="MXFP4 DFLASH requires no radix cache"):
+                validate_mxfp4_args(cfg, **kwargs)
+        else:
+            validate_mxfp4_args(cfg, **kwargs)
+
+
 @pytest.mark.parametrize("final", [False, True])
 @pytest.mark.parametrize("page_size", [1, 64])
 def test_native_fp4_indexer_is_rejected(page_size, final):
