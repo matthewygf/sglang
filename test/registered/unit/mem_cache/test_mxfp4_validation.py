@@ -176,24 +176,8 @@ def test_native_hicache_l2_is_admitted(page_size, io_backend, layout, final):
     validate_mxfp4_args(cfg, is_hip=True, native_page64=page_size == 64, final=final)
 
 
-@pytest.mark.parametrize("final", [False, True], ids=["raw", "resolved"])
-@pytest.mark.parametrize(
-    ("dcp_size", "comm_backend", "ring", "incompatible_flag"),
-    [
-        pytest.param(1, None, False, None, id="dcp1-default"),
-        pytest.param(1, "ag_rs", True, None, id="dcp1-ring-independent"),
-        pytest.param(1, "ag_rs", False, "enable_mixed_chunk", id="dcp1-mixed-chunk"),
-        pytest.param(1, "ag_rs", False, "enable_hierarchical_cache", id="dcp1-hicache"),
-        pytest.param(8, "a2a", True, None, id="dcp8-a2a-ring"),
-        pytest.param(8, "ag_rs", True, None, id="dcp8-no-a2a"),
-        pytest.param(8, "a2a", False, None, id="dcp8-no-ring"),
-    ],
-)
-def test_native_page64_dflash_radix_overlap(
-    monkeypatch, final, dcp_size, comm_backend, ring, incompatible_flag
-):
+def _dflash_radix_overlap_config(monkeypatch, final, dcp_size, comm_backend, ring):
     from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-    from sglang.srt.runtime_context import override_platform
     from sglang.srt.server_args import ServerArgs
 
     monkeypatch.setenv("SGLANG_RAGGED_VERIFY_MODE", "static")
@@ -225,8 +209,6 @@ def test_native_page64_dflash_radix_overlap(
         mamba_ssm_dtype="float32",
         enable_int8_mamba_checkpoint=False,
     )
-    if incompatible_flag:
-        setattr(cfg, incompatible_flag, True)
     if final:
         cfg.speculative_dflash_draft_kv_ring = ring
         cfg.speculative_num_draft_tokens = 6
@@ -236,6 +218,31 @@ def test_native_page64_dflash_radix_overlap(
             decode=PhaseConfig(), prefill=PhaseConfig()
         )
 
+    return cfg
+
+
+@pytest.mark.parametrize("final", [False, True], ids=["raw", "resolved"])
+@pytest.mark.parametrize(
+    ("dcp_size", "comm_backend", "ring", "incompatible_flag"),
+    [
+        pytest.param(1, None, False, None, id="dcp1-default"),
+        pytest.param(1, "ag_rs", True, None, id="dcp1-ring-independent"),
+        pytest.param(1, "ag_rs", False, "enable_mixed_chunk", id="dcp1-mixed-chunk"),
+        pytest.param(1, "ag_rs", False, "enable_hierarchical_cache", id="dcp1-hicache"),
+        pytest.param(8, "a2a", True, None, id="dcp8-a2a-ring"),
+        pytest.param(8, "ag_rs", True, None, id="dcp8-no-a2a"),
+        pytest.param(8, "a2a", False, None, id="dcp8-no-ring"),
+    ],
+)
+def test_native_page64_dflash_radix_overlap(
+    monkeypatch, final, dcp_size, comm_backend, ring, incompatible_flag
+):
+    from sglang.srt.runtime_context import override_platform
+
+    cfg = _dflash_radix_overlap_config(monkeypatch, final, dcp_size, comm_backend, ring)
+    if incompatible_flag:
+        setattr(cfg, incompatible_flag, True)
+
     # Test only the MXFP4 policy; the draft backend still validates ring support.
     with override_platform(is_hip=True, is_cuda=False, is_gfx95=True):
         kwargs = dict(is_hip=True, native_page64=True, final=final)
@@ -244,6 +251,44 @@ def test_native_page64_dflash_radix_overlap(
                 validate_mxfp4_args(cfg, **kwargs)
         else:
             validate_mxfp4_args(cfg, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("dcp_size", "max_bs", "admitted"),
+    [
+        pytest.param(1, 80, True, id="dcp1-80"),
+        pytest.param(8, 64, True, id="dcp8-64"),
+        pytest.param(8, 80, False, id="dcp8-80"),
+    ],
+)
+def test_native_page64_dflash_automatic_decode_buckets(
+    monkeypatch, dcp_size, max_bs, admitted
+):
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_decode_cuda_graph_batch_sizes,
+    )
+    from sglang.srt.model_executor.cuda_graph_config import Backend, PhaseConfig
+    from sglang.srt.runtime_context import override_platform
+
+    cfg = _dflash_radix_overlap_config(
+        monkeypatch,
+        final=True,
+        dcp_size=dcp_size,
+        comm_backend="a2a" if dcp_size == 8 else None,
+        ring=dcp_size == 8,
+    )
+    cfg.cuda_graph_config.decode = PhaseConfig(
+        backend=Backend.FULL,
+        bs=generate_decode_cuda_graph_batch_sizes(cfg, max_bs),
+        max_bs=max_bs,
+    )
+    with override_platform(is_hip=True, is_cuda=False, is_gfx95=True):
+        kwargs = dict(is_hip=True, native_page64=True, final=True)
+        if admitted:
+            validate_mxfp4_args(cfg, **kwargs)
+        else:
+            with pytest.raises(ValueError, match="automatic buckets through batch 64"):
+                validate_mxfp4_args(cfg, **kwargs)
 
 
 @pytest.mark.parametrize("final", [False, True])

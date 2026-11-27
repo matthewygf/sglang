@@ -239,7 +239,10 @@ def _validate_mxfp4_dflash(cfg, *, final: bool, native_page64: bool) -> None:
         automatic_batch64 = (
             not explicit_buckets
             and buckets[:1] == (1,)
-            and buckets[-1] == max_batch64
+            and (
+                buckets[-1] == max_batch64
+                or (cfg.dcp_size == 1 and buckets[-1] >= max_batch64)
+            )
             and buckets == tuple(sorted(set(buckets)))
         )
         explicit_multi_batch = (
