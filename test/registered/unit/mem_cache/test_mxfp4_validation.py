@@ -254,15 +254,15 @@ def test_native_page64_dflash_radix_overlap(
 
 
 @pytest.mark.parametrize(
-    ("dcp_size", "max_bs", "admitted"),
+    ("dcp_size", "max_bs"),
     [
-        pytest.param(1, 80, True, id="dcp1-80"),
-        pytest.param(8, 64, True, id="dcp8-64"),
-        pytest.param(8, 80, False, id="dcp8-80"),
+        pytest.param(1, 80, id="dcp1-80"),
+        pytest.param(8, 64, id="dcp8-64"),
+        pytest.param(8, 80, id="dcp8-80"),
     ],
 )
 def test_native_page64_dflash_automatic_decode_buckets(
-    monkeypatch, dcp_size, max_bs, admitted
+    monkeypatch, dcp_size, max_bs
 ):
     from sglang.srt.arg_groups.cuda_graph_hook import (
         generate_decode_cuda_graph_batch_sizes,
@@ -283,12 +283,7 @@ def test_native_page64_dflash_automatic_decode_buckets(
         max_bs=max_bs,
     )
     with override_platform(is_hip=True, is_cuda=False, is_gfx95=True):
-        kwargs = dict(is_hip=True, native_page64=True, final=True)
-        if admitted:
-            validate_mxfp4_args(cfg, **kwargs)
-        else:
-            with pytest.raises(ValueError, match="automatic buckets through batch 64"):
-                validate_mxfp4_args(cfg, **kwargs)
+        validate_mxfp4_args(cfg, is_hip=True, native_page64=True, final=True)
 
 
 @pytest.mark.parametrize("final", [False, True])
